@@ -22,9 +22,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.awt.SwingPanel
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.graphics.asSkiaBitmap
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.features.player.desktop.DesktopHostOs
@@ -32,12 +35,13 @@ import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
 import com.nuvio.app.features.player.desktop.NativePlayerController
 import com.nuvio.app.features.player.desktop.NativePlayerHost
 import com.nuvio.app.features.player.desktop.WaylandPlayerHost
-import com.nuvio.app.features.player.desktop.toggleDesktopAppFullscreen
+import com.nuvio.app.features.player.desktop.desktopFullscreenChanges
 import java.awt.AWTEvent
 import java.awt.Toolkit
 import java.awt.event.AWTEventListener
 import java.awt.event.MouseEvent
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.drop
 
 @Composable
 actual fun PlatformPlayerSurface(
@@ -63,7 +67,6 @@ actual fun PlatformPlayerSurface(
     onError: (String?) -> Unit,
 ) {
     if (DesktopHostOs.current == DesktopHostOs.LINUX && DesktopHostOs.isWayland) {
-        // Wayland: no wid support, must use SW rendering with Compose Canvas overlay
         LinuxWaylandPlayerSurface(
             sourceUrl = sourceUrl,
             sourceHeaders = sourceHeaders,
@@ -81,7 +84,6 @@ actual fun PlatformPlayerSurface(
             onError = onError,
         )
     } else if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS || DesktopHostOs.current == DesktopHostOs.LINUX) {
-        // macOS, Windows, and Linux X11: GPU-direct rendering via native view pointer
         NativePlayerSurface(
             sourceUrl = sourceUrl,
             sourceHeaders = sourceHeaders,
@@ -312,7 +314,7 @@ private fun NativePlayerSurface(
     val decoderPriority = playerSettings.decoderPriority
     val nvidiaRtxSuperResolutionEnabled = playerSettings.nvidiaRtxSuperResolutionEnabled
 
-    LaunchedEffect(controller) {
+    LaunchedEffect(controller, sourceUrl, playbackHeaders) {
         onControllerReady(controller)
     }
 
@@ -366,6 +368,7 @@ private fun NativePlayerSurface(
             nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
             onError = { message -> latestOnError.value(message) },
         )
+        onControllerReady(controller)
     }
 
     LaunchedEffect(controller, playWhenReady) {
@@ -378,6 +381,12 @@ private fun NativePlayerSurface(
 
     LaunchedEffect(controller, playerControlsState) {
         controller.updateControls(playerControlsState)
+    }
+
+    LaunchedEffect(controller) {
+        desktopFullscreenChanges.drop(1).collect {
+            controller.onDesktopFullscreenChanged()
+        }
     }
 
     LaunchedEffect(controller) {
