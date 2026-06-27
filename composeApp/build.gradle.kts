@@ -831,44 +831,6 @@ val buildWindowsPlayerBridge = tasks.register<Exec>("buildWindowsPlayerBridge") 
     commandLine(windowsPlayerBridgeCommand)
 }
 
-val linuxPlayerRuntimeSource = layout.projectDirectory.dir("src/desktopMain/native/linux/live")
-val linuxPlayerRuntimeOutput = layout.buildDirectory.dir("native/linux-runtime")
-val linuxPlayerBridgeSource = layout.projectDirectory.file("src/desktopMain/native/linux/player_bridge.c")
-val linuxPlayerBridgeOutput = layout.buildDirectory.file("native/linux/libplayer_bridge.so")
-if (isLinuxHost) {
-    linuxPlayerBridgeOutput.get().asFile.parentFile.mkdirs()
-}
-val linuxPlayerBridgeJavaHome = providers.systemProperty("java.home").get()
-val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
-    notCompatibleWithConfigurationCache("Builds a host-local player bridge for Linux.")
-    enabled = isLinuxHost
-    inputs.file(linuxPlayerBridgeSource)
-    outputs.file(linuxPlayerBridgeOutput)
-    doFirst {
-        val javaHome = linuxPlayerBridgeJavaHome
-        val javaIncludes = "-I${javaHome}/include -I${javaHome}/include/linux"
-        val linuxCc = providers.gradleProperty("linuxCc").getOrElse("gcc")
-        val extraCflags = providers.gradleProperty("linuxCflags").getOrElse("")
-        val mpvInclude = providers.gradleProperty("mpvInclude").getOrElse("/usr/include")
-        val mpvLib = providers.gradleProperty("mpvLib").getOrElse("")
-        val sourceFile = linuxPlayerBridgeSource.asFile
-        val outputFile = linuxPlayerBridgeOutput.get().asFile
-        commandLine(
-            linuxCc, "-shared", "-fPIC",
-            "-Wl,-rpath,'\$ORIGIN'",
-            "-o", outputFile.absolutePath,
-            sourceFile.absolutePath,
-            *javaIncludes.split(" ").filter { it.isNotBlank() }.toTypedArray(),
-            *extraCflags.split(" ").filter { it.isNotBlank() }.toTypedArray(),
-            "-I${mpvInclude}",
-            *mpvLib.split(" ").filter { it.isNotBlank() }.toTypedArray(),
-            "-include", "stddef.h",
-            "-lm", "-lpthread", "-ldl", "-lmpv",
-            "-lEGL", "-lGL", "-lgbm", "-lwayland-client", "-lwayland-egl",
-        )
-    }
-}
-
 val prepareWindowsPlayerRuntime = tasks.register<Sync>("prepareWindowsPlayerRuntime") {
     enabled = isWindowsHost
     into(windowsPlayerRuntimeOutput)
@@ -915,23 +877,6 @@ abstract class GenerateNativeRuntimeIndexTask : DefaultTask() {
             .sorted()
         indexFile.get().asFile.writeText(files.joinToString(separator = "\n", postfix = "\n"))
     }
-}
-
-val prepareLinuxPlayerRuntime = tasks.register<Sync>("prepareLinuxPlayerRuntime") {
-    enabled = isLinuxHost
-    into(linuxPlayerRuntimeOutput)
-    if (linuxPlayerRuntimeSource.asFile.isDirectory) {
-        from(linuxPlayerRuntimeSource) {
-            include("*.so*")
-        }
-    }
-}
-
-val generateLinuxPlayerRuntimeIndex = tasks.register<GenerateNativeRuntimeIndexTask>("generateLinuxPlayerRuntimeIndex") {
-    enabled = isLinuxHost
-    dependsOn(prepareLinuxPlayerRuntime)
-    runtimeDir.set(linuxPlayerRuntimeOutput)
-    indexFile.set(linuxPlayerRuntimeOutput.map { it.file("runtime-files.txt") })
 }
 
 val torrserverOutputDir = layout.buildDirectory.dir("native/torrserver")
@@ -1508,13 +1453,6 @@ configurations.all {
 }
 
 /* ── Linux native player bridge ── */
-fun List<String>.runCommand(): String? =
-    ProcessBuilder(this)
-        .redirectErrorStream(true)
-        .start()
-        .inputStream.bufferedReader().readText()
-        .takeIf { it.isNotBlank() }
-
 val linuxPlayerBridgeSource = layout.projectDirectory.file("src/desktopMain/native/linux/player_bridge.c")
 val linuxPlayerBridgeOutput = layout.buildDirectory.file("native/linux/libplayer_bridge.so")
 val linuxPlayerRuntimeSource = layout.projectDirectory.dir("src/desktopMain/native/linux/live")
@@ -1573,42 +1511,4 @@ val generateLinuxPlayerRuntimeIndex = tasks.register<GenerateNativeRuntimeIndexT
     indexFile.set(linuxPlayerRuntimeOutput.map { it.file("runtime-files.txt") })
 }
 
-tasks.withType<Jar>().configureEach {
-    if (isLinuxHost && name == "desktopJar") {
-        dependsOn(buildLinuxPlayerBridge, prepareLinuxPlayerRuntime, generateLinuxPlayerRuntimeIndex)
-        from(linuxPlayerBridgeOutput) {
-            into("native/linux")
-        }
-        from(linuxPlayerRuntimeOutput) {
-            into("native/linux")
-        }
-    }
-}
 
-if (isLinuxHost) {
-    val linuxNativePlayerTasks = setOf(
-        "run",
-        "runRelease",
-        "desktopRun",
-        "runDistributable",
-        "runReleaseDistributable",
-        "desktopRunHot",
-        "hotRunDesktop",
-        "hotRunDesktopAsync",
-        "hotDevDesktop",
-        "hotDevDesktopAsync",
-        "createDistributable",
-        "createReleaseDistributable",
-        "createRuntimeImage",
-        "package",
-        "packageDistributionForCurrentOS",
-        "packageDeb",
-        "packageUberJarForCurrentOS",
-        "packageReleaseDistributionForCurrentOS",
-        "packageReleaseDeb",
-        "packageReleaseUberJarForCurrentOS",
-    )
-    tasks.matching { it.name in linuxNativePlayerTasks }.configureEach {
-        dependsOn(buildLinuxPlayerBridge, prepareLinuxPlayerRuntime, generateLinuxPlayerRuntimeIndex)
-    }
-}
