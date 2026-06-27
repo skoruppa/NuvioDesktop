@@ -97,7 +97,8 @@ internal object NativePlayerBridge {
     external fun renderFrame(handle: Long, dstPixels: IntArray, dstW: Int, dstH: Int): Boolean
     external fun renderFrameBytes(handle: Long, dstBytes: ByteArray, dstW: Int, dstH: Int): Boolean
     external fun resizeNativeView(handle: Long, width: Int, height: Int)
-    external fun isWaylandSession(): Boolean
+    external fun videoWidth(handle: Long): Int
+    external fun videoHeight(handle: Long): Int
     external fun setProperty(handle: Long, name: String, value: String)
 
     val controlsPageUrl: String by lazy { controlsPageAssets.url }

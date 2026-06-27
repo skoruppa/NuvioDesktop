@@ -22,20 +22,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.awt.SwingPanel
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.graphics.toComposeImageBitmap
-import androidx.compose.ui.graphics.asSkiaBitmap
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
 import com.nuvio.app.features.player.desktop.NativePlayerController
 import com.nuvio.app.features.player.desktop.NativePlayerHost
-import com.nuvio.app.features.player.desktop.WaylandPlayerHost
+import com.nuvio.app.features.player.desktop.LinuxPlayerHost
 import com.nuvio.app.features.player.desktop.desktopFullscreenChanges
+import com.nuvio.app.features.player.desktop.toggleDesktopAppFullscreen
 import java.awt.AWTEvent
 import java.awt.Toolkit
 import java.awt.event.AWTEventListener
@@ -66,8 +64,12 @@ actual fun PlatformPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    if (DesktopHostOs.current == DesktopHostOs.LINUX && DesktopHostOs.isWayland) {
-        LinuxWaylandPlayerSurface(
+    if (DesktopHostOs.current == DesktopHostOs.LINUX) {
+        // Linux: use offscreen rendering with Compose Canvas overlay.
+        // This ensures player controls render correctly on top of the video.
+        // EGL FBO via GBM (gpuMode=2) with GLES, or SW fallback (gpuMode=0).
+        // GPU decode via hwdec=auto-copy (VAAPI on Intel/AMD, nvdec on NVIDIA).
+        LinuxPlayerSurface(
             sourceUrl = sourceUrl,
             sourceHeaders = sourceHeaders,
             modifier = modifier,
@@ -83,7 +85,8 @@ actual fun PlatformPlayerSurface(
             onSnapshot = onSnapshot,
             onError = onError,
         )
-    } else if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS || DesktopHostOs.current == DesktopHostOs.LINUX) {
+    } else if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS) {
+        // macOS, Windows, and Linux X11: GPU-direct rendering via native view pointer
         NativePlayerSurface(
             sourceUrl = sourceUrl,
             sourceHeaders = sourceHeaders,
@@ -110,11 +113,11 @@ actual fun PlatformPlayerSurface(
 }
 
 /**
- * Linux Wayland path: renders video frames in a Compose [Canvas] so controls overlay correctly.
- * mpv renders to EGL FBO (via GBM /dev/dri/renderD128), glReadPixels to byte[], Skia Image in Canvas.
+ * Linux path: renders video frames in a Compose [Canvas] so controls overlay correctly.
+ * mpv renders offscreen (EGL FBO via GBM or SW fallback), frames are pulled into Skia Image for Canvas.
  */
 @Composable
-private fun LinuxWaylandPlayerSurface(
+private fun LinuxPlayerSurface(
     sourceUrl: String,
     sourceHeaders: Map<String, String>,
     modifier: Modifier,
@@ -130,7 +133,7 @@ private fun LinuxWaylandPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    val host = remember { WaylandPlayerHost() }
+    val host = remember { LinuxPlayerHost() }
     val controller = remember(host) { NativePlayerController(host) }
     var surfaceSize by remember { mutableStateOf(IntSize.Zero) }
     var frameTick by remember { mutableIntStateOf(0) }
@@ -142,7 +145,7 @@ private fun LinuxWaylandPlayerSurface(
     val latestOnPlayerControlsScrubFinished = rememberUpdatedState(onPlayerControlsScrubFinished)
     val latestOnError = rememberUpdatedState(onError)
 
-    LaunchedEffect(controller) {
+    LaunchedEffect(controller, sourceUrl) {
         onControllerReady(controller)
     }
 
@@ -163,6 +166,8 @@ private fun LinuxWaylandPlayerSurface(
             sourceHeaders = playbackHeaders,
             playWhenReady = playWhenReady,
             initialPositionMs = initialPositionMs,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
             onError = { message -> latestOnError.value(message) },
         )
     }
@@ -262,10 +267,19 @@ private fun LinuxWaylandPlayerSurface(
                 val skiaImage = host.latestImage
                 if (skiaImage != null && !skiaImage.isClosed) {
                     val canvas = drawContext.canvas.nativeCanvas
+                    val imgW = skiaImage.width.toFloat()
+                    val imgH = skiaImage.height.toFloat()
+                    val dstW = size.width
+                    val dstH = size.height
+
+                    // Draw full FBO — mpv handles letterbox/zoom/stretch internally
+                    // via panscan property. Subtitles are always correctly positioned.
+                    val srcRect = org.jetbrains.skia.Rect.makeWH(imgW, imgH)
+                    val dstRect = org.jetbrains.skia.Rect.makeWH(dstW, dstH)
                     canvas.drawImageRect(
                         skiaImage,
-                        org.jetbrains.skia.Rect.makeWH(skiaImage.width.toFloat(), skiaImage.height.toFloat()),
-                        org.jetbrains.skia.Rect.makeWH(size.width, size.height),
+                        srcRect,
+                        dstRect,
                         org.jetbrains.skia.SamplingMode.DEFAULT,
                         org.jetbrains.skia.Paint(),
                         false,
