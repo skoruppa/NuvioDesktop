@@ -21,6 +21,8 @@
 #include <GL/glext.h>
 #include <fcntl.h>
 #include <gbm.h>
+#include <wayland-client.h>
+#include <wayland-egl.h>
 
 /* ------------------------------------------------------------------ */
 /*  Debug logging                                                      */
@@ -42,18 +44,10 @@ static void on_load(void) {
 static pthread_mutex_t glCacheMutex = PTHREAD_MUTEX_INITIALIZER;
 static struct {
     int valid;
-    int useGLX;
     int gbmFd;
     struct gbm_device *gbmDevice;
     EGLDisplay eglDisplay;
     EGLContext eglContext;
-    EGLSurface eglSurface;
-    mpv_handle *mpv;
-    mpv_render_context *renderCtx;
-    GLuint fbo;
-    GLuint fboTex;
-    int fboW;
-    int fboH;
 } glCache = {0};
 
 /* ------------------------------------------------------------------ */
@@ -69,8 +63,7 @@ typedef struct {
     char **headers;
     int nheaders;
     volatile int alive;
-    int gpuMode; /* 0 = SW rendering, 2 = GL offscreen (EGL or GLX FBO) */
-    int useGLX;  /* 0 = EGL path, 1 = GLX path */
+    int gpuMode; /* 0 = SW rendering, 2 = GL offscreen (EGL FBO) */
 
     /* SW mode (gpuMode 0) */
     pthread_t renderThread;
@@ -100,6 +93,8 @@ typedef struct {
     int fboW;
     int fboH;
 
+    /* Captured from JNI thread for shared context fallback (NVIDIA) */
+    EGLDisplay skiaDisplay;
 } CreateTask;
 
 static void callEventSink(JNIEnv *env, JavaVM *jvm,
@@ -131,61 +126,655 @@ static void callEventSink(JNIEnv *env, JavaVM *jvm,
 #define EGL_PLATFORM_GBM_KHR 0x31D7
 #endif
 
+#ifndef EGL_PLATFORM_DEVICE_EXT
+#define EGL_PLATFORM_DEVICE_EXT 0x313F
+#endif
+
 #ifndef EGL_EXT_platform_base
 typedef EGLDisplay (*PFNEGLGETPLATFORMDISPLAYEXTPROC)(EGLenum, void *, const EGLint *);
 #endif
 
-static int initEGL(CreateTask *task) {
-    eglReleaseThread();
+/* Use system-provided PFNEGLQUERYDEVICESEXTPROC from eglext.h if available */
+#ifndef EGL_EXT_device_enumeration
+typedef EGLBoolean (*PFNEGLQUERYDEVICESEXTPROC)(EGLint, void *, EGLint *);
+#endif
 
-    static const char *renderNodes[] = {
-        "/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130", NULL
+#ifndef EGL_PLATFORM_WAYLAND_KHR
+#define EGL_PLATFORM_WAYLAND_KHR 0x31D8
+#endif
+
+/* ------------------------------------------------------------------ */
+/*  EGL via Wayland display (required for NVIDIA on Wayland)           */
+/* ------------------------------------------------------------------ */
+static int initEGL_Wayland(CreateTask *task) {
+    const char *waylandDisplay = getenv("WAYLAND_DISPLAY");
+    if (!waylandDisplay || waylandDisplay[0] == '\0') {
+        const char *sessionType = getenv("XDG_SESSION_TYPE");
+        if (!sessionType || !strstr(sessionType, "wayland")) {
+            DBG("EGL: not a Wayland session, skipping Wayland EGL\n");
+            return 0;
+        }
+    }
+
+    struct wl_display *wl = wl_display_connect(NULL);
+    if (!wl) {
+        DBG("EGL: wl_display_connect failed\n");
+        return 0;
+    }
+    DBG("EGL: connected to Wayland display\n");
+
+    PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+
+    EGLDisplay display = EGL_NO_DISPLAY;
+    if (eglGetPlatformDisplayEXT) {
+        display = eglGetPlatformDisplayEXT(EGL_PLATFORM_WAYLAND_KHR, wl, NULL);
+    }
+    if (display == EGL_NO_DISPLAY) {
+        display = eglGetDisplay((EGLNativeDisplayType)wl);
+    }
+    if (display == EGL_NO_DISPLAY) {
+        DBG("EGL: Wayland EGL display failed\n");
+        wl_display_disconnect(wl);
+        return 0;
+    }
+
+    EGLint major, minor;
+    if (!eglInitialize(display, &major, &minor)) {
+        DBG("EGL: Wayland eglInitialize failed (err=0x%x)\n", eglGetError());
+        wl_display_disconnect(wl);
+        return 0;
+    }
+    DBG("EGL: Wayland EGL initialized %d.%d\n", major, minor);
+
+    eglBindAPI(EGL_OPENGL_API);
+
+    EGLint configAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint numConfigs;
+    int useGLES = 0;
+    if (!eglChooseConfig(display, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+        /* Try without PBUFFER requirement — Wayland may only support window surfaces */
+        EGLint configAttribs2[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        };
+        if (!eglChooseConfig(display, configAttribs2, &config, 1, &numConfigs) || numConfigs == 0) {
+            DBG("EGL: Wayland GL config failed, trying GLES\n");
+            eglBindAPI(EGL_OPENGL_ES_API);
+            EGLint glesAttribs[] = {
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                EGL_NONE
+            };
+            if (!eglChooseConfig(display, glesAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+                DBG("EGL: Wayland no suitable config\n");
+                eglTerminate(display);
+                wl_display_disconnect(wl);
+                return 0;
+            }
+            useGLES = 1;
+        }
+    }
+
+    EGLContext ctx = EGL_NO_CONTEXT;
+    if (!useGLES) {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                                EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                                EGL_NONE };
+        ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+        if (ctx == EGL_NO_CONTEXT) {
+            EGLint ctxAttribs2[] = { EGL_NONE };
+            ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs2);
+        }
+    } else {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+        ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+    }
+    if (ctx == EGL_NO_CONTEXT) {
+        DBG("EGL: Wayland context creation failed (err=0x%x)\n", eglGetError());
+        eglTerminate(display);
+        wl_display_disconnect(wl);
+        return 0;
+    }
+
+    /* Try pbuffer surface first */
+    EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    EGLSurface surface = eglCreatePbufferSurface(display, config, pbufAttribs);
+    if (surface == EGL_NO_SURFACE) {
+        DBG("EGL: Wayland pbuffer failed, trying surfaceless\n");
+        surface = EGL_NO_SURFACE;
+    }
+
+    /* Test MakeCurrent */
+    EGLSurface testSurf = (surface != EGL_NO_SURFACE) ? surface : EGL_NO_SURFACE;
+    if (!eglMakeCurrent(display, testSurf, testSurf, ctx)) {
+        DBG("EGL: Wayland eglMakeCurrent failed (err=0x%x)\n", eglGetError());
+        eglDestroyContext(display, ctx);
+        if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+        eglTerminate(display);
+        wl_display_disconnect(wl);
+        return 0;
+    }
+
+    /* Success! */
+    eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    task->eglDisplay = display;
+    task->eglContext = ctx;
+    task->eglSurface = surface;
+
+    /* Open a DRM render node for VAAPI/nvdec interop (mpv DRM_DISPLAY_V2).
+     * The EGL display is Wayland-based but mpv still needs a DRM fd for hw decode. */
+    if (task->gbmFd <= 0) {
+        static const char *drmNodes[] = {"/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130", NULL};
+        for (int i = 0; drmNodes[i]; i++) {
+            int fd = open(drmNodes[i], O_RDWR);
+            if (fd >= 0) {
+                task->gbmFd = fd;
+                DBG("EGL: Wayland path opened DRM node %s for hw interop\n", drmNodes[i]);
+                break;
+            }
+        }
+    }
+
+    DBG("EGL: Wayland EGL context ready (display=%p, surface=%s, api=%s, drmFd=%d)\n",
+        (void*)display, surface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless",
+        useGLES ? "GLES" : "GL", task->gbmFd);
+    /* NOTE: wl_display intentionally leaked — needed for EGL display lifetime */
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  EGL via NVIDIA vendor library (bypasses Mesa dispatcher)           */
+/* ------------------------------------------------------------------ */
+typedef EGLDisplay (*PFN_eglGetPlatformDisplay)(EGLenum, void*, const EGLint*);
+typedef EGLBoolean (*PFN_eglInitialize)(EGLDisplay, EGLint*, EGLint*);
+typedef EGLBoolean (*PFN_eglBindAPI)(EGLenum);
+typedef EGLBoolean (*PFN_eglChooseConfig)(EGLDisplay, const EGLint*, EGLConfig*, EGLint, EGLint*);
+typedef EGLContext (*PFN_eglCreateContext)(EGLDisplay, EGLConfig, EGLContext, const EGLint*);
+typedef EGLSurface (*PFN_eglCreatePbufferSurface)(EGLDisplay, EGLConfig, const EGLint*);
+typedef EGLBoolean (*PFN_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+typedef EGLBoolean (*PFN_eglQueryDevicesEXT)(EGLint, EGLDeviceEXT*, EGLint*);
+typedef void* (*PFN_eglGetProcAddress)(const char*);
+typedef EGLint (*PFN_eglGetError)(void);
+typedef EGLBoolean (*PFN_eglReleaseThread)(void);
+
+static int initEGL_NvidiaVendor(CreateTask *task) {
+    /* Try to load NVIDIA's vendor-specific EGL library directly.
+     * This bypasses the Mesa GLVND dispatcher which may route to the wrong implementation. */
+    static const char *nvLibPaths[] = {
+        "libEGL_nvidia.so.0",
+        "libEGL_nvidia.so",
+        "/usr/lib/x86_64-linux-gnu/libEGL_nvidia.so.0",
+        "/usr/lib64/libEGL_nvidia.so.0",
+        NULL
     };
 
-    for (int nodeIdx = 0; renderNodes[nodeIdx]; nodeIdx++) {
-        int origFd = open(renderNodes[nodeIdx], O_RDWR);
-        if (origFd < 0) continue;
-        task->gbmFd = dup(origFd);
-        close(origFd);
-        if (task->gbmFd < 0) continue;
-
-        task->gbmDevice = gbm_create_device(task->gbmFd);
-        if (!task->gbmDevice) { close(task->gbmFd); task->gbmFd = -1; continue; }
-        DBG("EGL: trying render node %s\n", renderNodes[nodeIdx]);
-
-        PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
-            (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-        if (eglGetPlatformDisplayEXT) {
-            task->eglDisplay = eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, task->gbmDevice, NULL);
-        } else {
-            task->eglDisplay = eglGetDisplay((EGLNativeDisplayType)task->gbmDevice);
+    void *nvEGL = NULL;
+    for (int i = 0; nvLibPaths[i]; i++) {
+        nvEGL = dlopen(nvLibPaths[i], RTLD_NOW);
+        if (nvEGL) {
+            DBG("EGL: loaded NVIDIA vendor library: %s\n", nvLibPaths[i]);
+            break;
         }
-        if (task->eglDisplay == EGL_NO_DISPLAY) {
-            gbm_device_destroy(task->gbmDevice); close(task->gbmFd);
-            task->gbmFd = -1; task->gbmDevice = NULL; continue;
+    }
+    if (!nvEGL) {
+        DBG("EGL: NVIDIA vendor library not found\n");
+        return 0;
+    }
+
+    /* Resolve EGL functions from NVIDIA library */
+    PFN_eglGetPlatformDisplay nv_eglGetPlatformDisplay =
+        (PFN_eglGetPlatformDisplay)dlsym(nvEGL, "eglGetPlatformDisplay");
+    PFN_eglInitialize nv_eglInitialize = (PFN_eglInitialize)dlsym(nvEGL, "eglInitialize");
+    PFN_eglBindAPI nv_eglBindAPI = (PFN_eglBindAPI)dlsym(nvEGL, "eglBindAPI");
+    PFN_eglChooseConfig nv_eglChooseConfig = (PFN_eglChooseConfig)dlsym(nvEGL, "eglChooseConfig");
+    PFN_eglCreateContext nv_eglCreateContext = (PFN_eglCreateContext)dlsym(nvEGL, "eglCreateContext");
+    PFN_eglCreatePbufferSurface nv_eglCreatePbufferSurface = (PFN_eglCreatePbufferSurface)dlsym(nvEGL, "eglCreatePbufferSurface");
+    PFN_eglMakeCurrent nv_eglMakeCurrent = (PFN_eglMakeCurrent)dlsym(nvEGL, "eglMakeCurrent");
+    PFN_eglQueryDevicesEXT nv_eglQueryDevicesEXT = (PFN_eglQueryDevicesEXT)dlsym(nvEGL, "eglQueryDevicesEXT");
+    PFN_eglGetProcAddress nv_eglGetProcAddress = (PFN_eglGetProcAddress)dlsym(nvEGL, "eglGetProcAddress");
+    PFN_eglGetError nv_eglGetError = (PFN_eglGetError)dlsym(nvEGL, "eglGetError");
+    PFN_eglReleaseThread nv_eglReleaseThread = (PFN_eglReleaseThread)dlsym(nvEGL, "eglReleaseThread");
+
+    if (!nv_eglGetPlatformDisplay || !nv_eglInitialize || !nv_eglMakeCurrent || !nv_eglCreateContext) {
+        DBG("EGL: NVIDIA vendor lib missing required symbols, trying GLVND dispatch override\n");
+        dlclose(nvEGL);
+
+        /* Alternative: set __EGL_VENDOR_LIBRARY_FILENAMES to force NVIDIA vendor in GLVND.
+         * Then use standard EGL functions which will be dispatched to NVIDIA. */
+        static const char *nvJsonPaths[] = {
+            "/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+            "/usr/share/egl/egl_external_platform.d/10_nvidia.json",
+            "/etc/glvnd/egl_vendor.d/10_nvidia.json",
+            NULL
+        };
+        const char *nvJson = NULL;
+        for (int i = 0; nvJsonPaths[i]; i++) {
+            if (access(nvJsonPaths[i], R_OK) == 0) {
+                nvJson = nvJsonPaths[i];
+                break;
+            }
+        }
+        if (!nvJson) {
+            DBG("EGL: NVIDIA GLVND vendor JSON not found\n");
+            return 0;
+        }
+        DBG("EGL: overriding EGL vendor to: %s\n", nvJson);
+
+        /* Save and override */
+        const char *oldVendor = getenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+        char oldVendorBuf[512] = {0};
+        if (oldVendor) strncpy(oldVendorBuf, oldVendor, sizeof(oldVendorBuf)-1);
+        setenv("__EGL_VENDOR_LIBRARY_FILENAMES", nvJson, 1);
+
+        /* Now standard EGL calls should go through NVIDIA */
+        eglReleaseThread();
+
+        /* Open GBM device for NVIDIA render node */
+        int nvFd = -1;
+        static const char *nvRenderNodes[] = {"/dev/dri/renderD129", "/dev/dri/renderD128", "/dev/dri/renderD130", NULL};
+        for (int i = 0; nvRenderNodes[i]; i++) {
+            nvFd = open(nvRenderNodes[i], O_RDWR);
+            if (nvFd >= 0) {
+                DBG("EGL: trying render node %s (fd=%d)\n", nvRenderNodes[i], nvFd);
+                break;
+            }
+        }
+        if (nvFd < 0) {
+            DBG("EGL: no render node available\n");
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        struct gbm_device *gbmDev = gbm_create_device(nvFd);
+        if (!gbmDev) {
+            DBG("EGL: GBM device creation failed for NVIDIA override\n");
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        PFNEGLGETPLATFORMDISPLAYEXTPROC getPlatDisp =
+            (PFNEGLGETPLATFORMDISPLAYEXTPROC)(void*)eglGetProcAddress("eglGetPlatformDisplayEXT");
+        EGLDisplay display = EGL_NO_DISPLAY;
+        if (getPlatDisp) {
+            display = getPlatDisp(EGL_PLATFORM_GBM_KHR, gbmDev, NULL);
+        }
+        if (display == EGL_NO_DISPLAY) {
+            display = eglGetDisplay((EGLNativeDisplayType)gbmDev);
+        }
+        if (display == EGL_NO_DISPLAY) {
+            DBG("EGL: NVIDIA override display failed\n");
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
         }
 
         EGLint major, minor;
-        if (!eglInitialize(task->eglDisplay, &major, &minor)) {
-            gbm_device_destroy(task->gbmDevice); close(task->gbmFd);
-            task->gbmFd = -1; task->gbmDevice = NULL; task->eglDisplay = EGL_NO_DISPLAY; continue;
+        if (!eglInitialize(display, &major, &minor)) {
+            DBG("EGL: NVIDIA override eglInitialize failed\n");
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
         }
-        DBG("EGL: initialized %d.%d via GBM\n", major, minor);
+        DBG("EGL: NVIDIA override initialized %d.%d\n", major, minor);
 
-        /* Use Desktop GL — NVIDIA goes through GLX fallback anyway */
         eglBindAPI(EGL_OPENGL_API);
         EGLint configAttribs[] = {
             EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
             EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
             EGL_NONE
         };
         EGLConfig config;
         EGLint numConfigs;
+        if (!eglChooseConfig(display, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+            DBG("EGL: NVIDIA override config failed\n");
+            eglTerminate(display);
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                                EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                                EGL_NONE };
+        EGLContext ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+        if (ctx == EGL_NO_CONTEXT) {
+            EGLint ctxAttribs2[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+            ctx = eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs2);
+        }
+        if (ctx == EGL_NO_CONTEXT) {
+            DBG("EGL: NVIDIA override context failed\n");
+            eglTerminate(display);
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+        EGLSurface surface = eglCreatePbufferSurface(display, config, pbufAttribs);
+        EGLSurface testSurf = (surface != EGL_NO_SURFACE) ? surface : EGL_NO_SURFACE;
+
+        if (!eglMakeCurrent(display, testSurf, testSurf, ctx)) {
+            DBG("EGL: NVIDIA override eglMakeCurrent failed (err=0x%x)\n", eglGetError());
+            eglDestroyContext(display, ctx);
+            if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+            eglTerminate(display);
+            gbm_device_destroy(gbmDev);
+            close(nvFd);
+            if (oldVendorBuf[0]) setenv("__EGL_VENDOR_LIBRARY_FILENAMES", oldVendorBuf, 1);
+            else unsetenv("__EGL_VENDOR_LIBRARY_FILENAMES");
+            return 0;
+        }
+
+        /* Success! */
+        eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        task->eglDisplay = display;
+        task->eglContext = ctx;
+        task->eglSurface = surface;
+        task->gbmFd = nvFd;
+        task->gbmDevice = gbmDev;
+        DBG("EGL: NVIDIA GLVND override context ready (display=%p, surface=%s)\n",
+            (void*)display, surface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless");
+        /* Keep vendor override active for this process */
+        return 1;
+    }
+
+    if (nv_eglReleaseThread) nv_eglReleaseThread();
+
+    /* Get NVIDIA EGL device and create platform display */
+    EGLDisplay display = EGL_NO_DISPLAY;
+
+    if (nv_eglQueryDevicesEXT) {
+        EGLDeviceEXT devices[4];
+        EGLint numDevices = 0;
+        if (nv_eglQueryDevicesEXT(4, devices, &numDevices) && numDevices > 0) {
+            /* EGL_PLATFORM_DEVICE_EXT through NVIDIA's own library */
+            display = nv_eglGetPlatformDisplay(EGL_PLATFORM_DEVICE_EXT, devices[0], NULL);
+            DBG("EGL: NVIDIA vendor device display=%p (from %d devices)\n", (void*)display, numDevices);
+        }
+    }
+
+    if (display == EGL_NO_DISPLAY) {
+        /* Fallback to GBM platform through NVIDIA */
+        if (task->gbmDevice) {
+            display = nv_eglGetPlatformDisplay(EGL_PLATFORM_GBM_KHR, task->gbmDevice, NULL);
+            DBG("EGL: NVIDIA vendor GBM display=%p\n", (void*)display);
+        }
+    }
+
+    if (display == EGL_NO_DISPLAY) {
+        DBG("EGL: NVIDIA vendor could not get display\n");
+        dlclose(nvEGL);
+        return 0;
+    }
+
+    EGLint major, minor;
+    if (!nv_eglInitialize(display, &major, &minor)) {
+        DBG("EGL: NVIDIA vendor eglInitialize failed\n");
+        dlclose(nvEGL);
+        return 0;
+    }
+    DBG("EGL: NVIDIA vendor initialized %d.%d\n", major, minor);
+
+    if (nv_eglBindAPI) nv_eglBindAPI(EGL_OPENGL_API);
+
+    EGLint configAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint numConfigs;
+    if (!nv_eglChooseConfig(display, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+        DBG("EGL: NVIDIA vendor chooseConfig failed\n");
+        dlclose(nvEGL);
+        return 0;
+    }
+
+    EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                            EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                            EGL_NONE };
+    EGLContext ctx = nv_eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs);
+    if (ctx == EGL_NO_CONTEXT) {
+        EGLint ctxAttribs2[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+        ctx = nv_eglCreateContext(display, config, EGL_NO_CONTEXT, ctxAttribs2);
+    }
+    if (ctx == EGL_NO_CONTEXT) {
+        DBG("EGL: NVIDIA vendor context creation failed (err=0x%x)\n", nv_eglGetError ? nv_eglGetError() : 0);
+        dlclose(nvEGL);
+        return 0;
+    }
+
+    EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    EGLSurface surface = nv_eglCreatePbufferSurface(display, config, pbufAttribs);
+    if (surface == EGL_NO_SURFACE) {
+        DBG("EGL: NVIDIA vendor pbuffer failed, trying surfaceless\n");
+        surface = EGL_NO_SURFACE;
+    }
+
+    /* Test MakeCurrent */
+    EGLSurface testSurf = (surface != EGL_NO_SURFACE) ? surface : EGL_NO_SURFACE;
+    if (!nv_eglMakeCurrent(display, testSurf, testSurf, ctx)) {
+        DBG("EGL: NVIDIA vendor eglMakeCurrent failed (err=0x%x)\n", nv_eglGetError ? nv_eglGetError() : 0);
+        dlclose(nvEGL);
+        return 0;
+    }
+
+    /* Success! Unbind and store */
+    nv_eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    task->eglDisplay = display;
+    task->eglContext = ctx;
+    task->eglSurface = surface;
+    DBG("EGL: NVIDIA vendor context ready (display=%p, surface=%s)\n",
+        (void*)display, surface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless");
+
+    /* NOTE: we intentionally keep nvEGL handle open (leaked) — the display/context
+     * depend on this library being loaded for the process lifetime. */
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  EGL shared context (piggyback on Skia/Compose's EGLDisplay)        */
+/* ------------------------------------------------------------------ */
+static int initEGL_SharedContext(CreateTask *task) {
+    DBG("EGL: trying shared context with Skia's EGLDisplay\n");
+
+    /* Use the display captured from JNI thread (where Skia may have been active) */
+    EGLDisplay skiaDisplay = task->skiaDisplay;
+
+    DBG("EGL: skiaDisplay=%p (captured from JNI thread)\n", (void*)skiaDisplay);
+
+    if (skiaDisplay == EGL_NO_DISPLAY) {
+        /* Last resort: try default display */
+        skiaDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (skiaDisplay == EGL_NO_DISPLAY) {
+            DBG("EGL: no usable display found for shared context\n");
+            return 0;
+        }
+    }
+
+    /* Ensure it's initialized (idempotent if already initialized by Skia) */
+    EGLint major, minor;
+    if (!eglInitialize(skiaDisplay, &major, &minor)) {
+        DBG("EGL: shared display init failed\n");
+        return 0;
+    }
+    DBG("EGL: shared display initialized %d.%d\n", major, minor);
+
+    task->eglDisplay = skiaDisplay;
+
+    /* Bind GL API (Skia may use GLES — try GL first, fallback GLES) */
+    eglBindAPI(EGL_OPENGL_API);
+
+    EGLint configAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint numConfigs;
+    int useGLES = 0;
+    if (!eglChooseConfig(task->eglDisplay, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+        DBG("EGL: shared GL config failed, trying GLES\n");
+        eglBindAPI(EGL_OPENGL_ES_API);
+        EGLint glesAttribs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        };
+        if (!eglChooseConfig(task->eglDisplay, glesAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+            DBG("EGL: shared context: no suitable config\n");
+            task->eglDisplay = EGL_NO_DISPLAY;
+            return 0;
+        }
+        useGLES = 1;
+    }
+
+    /* Create context on the shared display — no share with Skia's context
+     * (we don't have access to it from render thread, but using the same
+     * display should bypass NVIDIA's multi-display restriction) */
+    EGLContext ctx = EGL_NO_CONTEXT;
+
+    if (!useGLES) {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                                EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                                EGL_NONE };
+        ctx = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs);
+        if (ctx == EGL_NO_CONTEXT) {
+            EGLint ctxAttribs2[] = { EGL_NONE };
+            ctx = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs2);
+        }
+    } else {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+        ctx = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs);
+    }
+
+    if (ctx == EGL_NO_CONTEXT) {
+        DBG("EGL: shared context creation failed (err=0x%x)\n", eglGetError());
+        task->eglDisplay = EGL_NO_DISPLAY;
+        return 0;
+    }
+    task->eglContext = ctx;
+    DBG("EGL: shared context created (api=%s)\n", useGLES ? "GLES" : "GL");
+
+    /* Create pbuffer surface */
+    EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    task->eglSurface = eglCreatePbufferSurface(task->eglDisplay, config, pbufAttribs);
+    if (task->eglSurface == EGL_NO_SURFACE) {
+        DBG("EGL: shared pbuffer failed, will use surfaceless\n");
+        task->eglSurface = EGL_NO_SURFACE;
+    }
+
+    /* DO NOT test eglMakeCurrent here — we're on the JNI thread where Skia's context
+     * may be active. The render thread will do MakeCurrent. Just verify context was created. */
+    DBG("EGL: shared context ready (display=%p, surface=%s)\n",
+        (void*)task->eglDisplay,
+        task->eglSurface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless");
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/*  EGL Device Platform fallback (headless, works on NVIDIA without    */
+/*  GBM surfaceless issues)                                            */
+/* ------------------------------------------------------------------ */
+static int initEGL_DevicePlatform(CreateTask *task) {
+    DBG("EGL: trying EGL_PLATFORM_DEVICE_EXT fallback\n");
+
+    /* Clear any stale EGL thread state (NVIDIA keeps per-thread state) */
+    eglReleaseThread();
+
+    PFNEGLQUERYDEVICESEXTPROC eglQueryDevicesEXT =
+        (PFNEGLQUERYDEVICESEXTPROC)(void*)eglGetProcAddress("eglQueryDevicesEXT");
+    PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)(void*)eglGetProcAddress("eglGetPlatformDisplayEXT");
+
+    if (!eglQueryDevicesEXT || !eglGetPlatformDisplayEXT) {
+        DBG("EGL: Device Platform extensions not available\n");
+        return 0;
+    }
+
+    /* EGLDeviceEXT is void* — query available devices */
+    EGLDeviceEXT devices[8];
+    EGLint numDevices = 0;
+    if (!eglQueryDevicesEXT(8, devices, &numDevices) || numDevices == 0) {
+        DBG("EGL: eglQueryDevicesEXT found no devices\n");
+        return 0;
+    }
+    DBG("EGL: found %d EGL devices\n", numDevices);
+
+    for (int i = 0; i < numDevices; i++) {
+        task->eglDisplay = eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, devices[i], NULL);
+        if (task->eglDisplay == EGL_NO_DISPLAY) continue;
+
+        EGLint major, minor;
+        if (!eglInitialize(task->eglDisplay, &major, &minor)) {
+            task->eglDisplay = EGL_NO_DISPLAY;
+            continue;
+        }
+        DBG("EGL: Device[%d] initialized %d.%d\n", i, major, minor);
+
+        /* Log client extensions for diagnostics */
+        const char *exts = eglQueryString(task->eglDisplay, EGL_EXTENSIONS);
+        int hasSurfaceless = exts && strstr(exts, "EGL_KHR_surfaceless_context") != NULL;
+        int hasCreateCtx = exts && strstr(exts, "EGL_KHR_create_context") != NULL;
+        DBG("EGL: Device[%d] surfaceless=%d create_context=%d\n", i, hasSurfaceless, hasCreateCtx);
+
+        /* Bind OpenGL (NVIDIA device platform supports full GL with pbuffer) */
+        eglBindAPI(EGL_OPENGL_API);
+
+        EGLint configAttribs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        };
+        EGLConfig config;
+        EGLint numConfigs;
         if (!eglChooseConfig(task->eglDisplay, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
-            DBG("EGL: config failed\n");
-            eglTerminate(task->eglDisplay); gbm_device_destroy(task->gbmDevice);
-            close(task->gbmFd); task->gbmFd = -1; task->gbmDevice = NULL;
-            task->eglDisplay = EGL_NO_DISPLAY; continue;
+            DBG("EGL: Device[%d] GL config failed, trying GLES\n", i);
+            eglBindAPI(EGL_OPENGL_ES_API);
+            EGLint glesAttribs[] = {
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+                EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+                EGL_RED_SIZE, 8,
+                EGL_GREEN_SIZE, 8,
+                EGL_BLUE_SIZE, 8,
+                EGL_ALPHA_SIZE, 8,
+                EGL_NONE
+            };
+            if (!eglChooseConfig(task->eglDisplay, glesAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+                eglTerminate(task->eglDisplay);
+                task->eglDisplay = EGL_NO_DISPLAY;
+                continue;
+            }
         }
 
         EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
@@ -193,169 +782,287 @@ static int initEGL(CreateTask *task) {
                                 EGL_NONE };
         task->eglContext = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs);
         if (task->eglContext == EGL_NO_CONTEXT) {
-            /* Fallback: try without core profile */
-            EGLint ctxAttribs2[] = { EGL_NONE };
+            EGLint ctxAttribs2[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
             task->eglContext = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs2);
         }
         if (task->eglContext == EGL_NO_CONTEXT) {
-            DBG("EGL: context creation failed (err=0x%x)\n", eglGetError());
-            eglTerminate(task->eglDisplay); gbm_device_destroy(task->gbmDevice);
-            close(task->gbmFd); task->gbmFd = -1; task->gbmDevice = NULL;
-            task->eglDisplay = EGL_NO_DISPLAY; continue;
+            DBG("EGL: Device[%d] context creation failed\n", i);
+            eglTerminate(task->eglDisplay);
+            task->eglDisplay = EGL_NO_DISPLAY;
+            continue;
         }
 
-        /* Surface: try pbuffer, then GBM window surface, then surfaceless */
-        task->eglSurface = EGL_NO_SURFACE;
+        /* Create 1x1 pbuffer — NVIDIA device platform supports this reliably */
         EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
         task->eglSurface = eglCreatePbufferSurface(task->eglDisplay, config, pbufAttribs);
         if (task->eglSurface == EGL_NO_SURFACE) {
-            struct gbm_surface *gbmSurf = gbm_surface_create(task->gbmDevice,
-                16, 16, GBM_FORMAT_ARGB8888, GBM_BO_USE_RENDERING);
-            if (gbmSurf) {
-                task->eglSurface = eglCreateWindowSurface(task->eglDisplay, config,
-                    (EGLNativeWindowType)gbmSurf, NULL);
-                if (task->eglSurface == EGL_NO_SURFACE) gbm_surface_destroy(gbmSurf);
-            }
+            DBG("EGL: Device[%d] pbuffer failed (err=0x%x)\n", i, eglGetError());
+            task->eglSurface = EGL_NO_SURFACE;
+        } else {
+            DBG("EGL: Device[%d] pbuffer created OK\n", i);
         }
 
-        /* Verify eglMakeCurrent */
+        /* Verify MakeCurrent works — try with pbuffer first, then surfaceless */
         EGLSurface testSurf = (task->eglSurface != EGL_NO_SURFACE) ? task->eglSurface : EGL_NO_SURFACE;
         if (!eglMakeCurrent(task->eglDisplay, testSurf, testSurf, task->eglContext)) {
-            DBG("EGL: eglMakeCurrent failed (err=0x%x)\n", eglGetError());
+            EGLint mkErr = eglGetError();
+            DBG("EGL: Device[%d] eglMakeCurrent failed (surface=%s, err=0x%x)\n",
+                i, testSurf != EGL_NO_SURFACE ? "pbuffer" : "surfaceless", mkErr);
+
+            /* If we had pbuffer and it failed, try surfaceless */
+            if (testSurf != EGL_NO_SURFACE) {
+                eglDestroySurface(task->eglDisplay, task->eglSurface);
+                task->eglSurface = EGL_NO_SURFACE;
+                if (eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext)) {
+                    DBG("EGL: Device[%d] surfaceless MakeCurrent OK\n", i);
+                    goto device_success;
+                }
+                DBG("EGL: Device[%d] surfaceless also failed (err=0x%x)\n", i, eglGetError());
+            }
+
+            /* Try switching to GLES API if we were using GL */
+            eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
             eglDestroyContext(task->eglDisplay, task->eglContext);
-            if (task->eglSurface != EGL_NO_SURFACE) eglDestroySurface(task->eglDisplay, task->eglSurface);
-            eglTerminate(task->eglDisplay); gbm_device_destroy(task->gbmDevice);
-            close(task->gbmFd); task->gbmFd = -1; task->gbmDevice = NULL;
-            task->eglDisplay = EGL_NO_DISPLAY; task->eglContext = EGL_NO_CONTEXT;
-            task->eglSurface = EGL_NO_SURFACE; continue;
+            task->eglContext = EGL_NO_CONTEXT;
+
+            DBG("EGL: Device[%d] retrying with GLES API\n", i);
+            eglBindAPI(EGL_OPENGL_ES_API);
+            EGLint glesRetryAttribs[] = {
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+                EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                EGL_NONE
+            };
+            EGLConfig glesConfig;
+            EGLint glesNumConfigs;
+            if (eglChooseConfig(task->eglDisplay, glesRetryAttribs, &glesConfig, 1, &glesNumConfigs) && glesNumConfigs > 0) {
+                EGLint glesCtxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+                task->eglContext = eglCreateContext(task->eglDisplay, glesConfig, EGL_NO_CONTEXT, glesCtxAttribs);
+                if (task->eglContext != EGL_NO_CONTEXT) {
+                    EGLint pb[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+                    task->eglSurface = eglCreatePbufferSurface(task->eglDisplay, glesConfig, pb);
+                    EGLSurface s = (task->eglSurface != EGL_NO_SURFACE) ? task->eglSurface : EGL_NO_SURFACE;
+                    if (eglMakeCurrent(task->eglDisplay, s, s, task->eglContext)) {
+                        DBG("EGL: Device[%d] GLES+pbuffer MakeCurrent OK\n", i);
+                        goto device_success;
+                    }
+                    /* Try surfaceless with GLES */
+                    if (task->eglSurface != EGL_NO_SURFACE) {
+                        eglDestroySurface(task->eglDisplay, task->eglSurface);
+                        task->eglSurface = EGL_NO_SURFACE;
+                    }
+                    if (eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, task->eglContext)) {
+                        DBG("EGL: Device[%d] GLES+surfaceless MakeCurrent OK\n", i);
+                        goto device_success;
+                    }
+                    DBG("EGL: Device[%d] GLES MakeCurrent also failed (err=0x%x)\n", i, eglGetError());
+                    eglDestroyContext(task->eglDisplay, task->eglContext);
+                    task->eglContext = EGL_NO_CONTEXT;
+                }
+            }
+
+            eglTerminate(task->eglDisplay);
+            task->eglDisplay = EGL_NO_DISPLAY;
+            task->eglContext = EGL_NO_CONTEXT;
+            task->eglSurface = EGL_NO_SURFACE;
+            continue;
         }
 
-        /* Success */
+device_success:
+        /* SUCCESS! Unbind — render thread will rebind */
         eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        DBG("EGL: GBM context ready (surface=%s)\n",
-            task->eglSurface != EGL_NO_SURFACE ? "window/pbuffer" : "surfaceless");
+        DBG("EGL: Device Platform context created successfully (device=%d, surface=%s)\n",
+            i, task->eglSurface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless");
         return 1;
     }
 
-    DBG("EGL: all render nodes failed\n");
+    DBG("EGL: all Device Platform attempts failed\n");
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/*  GLX offscreen context (fallback for NVIDIA where EGL fails)        */
-/* ------------------------------------------------------------------ */
-#include <X11/Xlib.h>
-#include <GL/glx.h>
+static int initEGL(CreateTask *task) {
+    /* Clear any stale EGL thread state from Skia/Compose */
+    eglReleaseThread();
 
-static Display *glxDisplay = NULL;
-static GLXContext glxContext = NULL;
-static GLXPbuffer glxPbuffer = 0;
-
-static int initGLX(CreateTask *task) {
-    DBG("GLX: trying X11 offscreen context\n");
-
-    glxDisplay = XOpenDisplay(NULL);
-    if (!glxDisplay) {
-        DBG("GLX: XOpenDisplay failed (no X11/XWayland?)\n");
-        return 0;
-    }
-
-    int screen = DefaultScreen(glxDisplay);
-    int fbAttribs[] = {
-        GLX_RENDER_TYPE, GLX_RGBA_BIT,
-        GLX_DRAWABLE_TYPE, GLX_PBUFFER_BIT,
-        GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8, GLX_ALPHA_SIZE, 8,
-        GLX_DOUBLEBUFFER, False,
-        None
-    };
-    int fbCount = 0;
-    GLXFBConfig *fbConfigs = glXChooseFBConfig(glxDisplay, screen, fbAttribs, &fbCount);
-    if (!fbConfigs || fbCount == 0) {
-        DBG("GLX: no suitable FBConfig\n");
-        XCloseDisplay(glxDisplay); glxDisplay = NULL;
-        return 0;
-    }
-
-    glxContext = glXCreateNewContext(glxDisplay, fbConfigs[0], GLX_RGBA_TYPE, NULL, True);
-    if (!glxContext) {
-        DBG("GLX: context creation failed\n");
-        XFree(fbConfigs); XCloseDisplay(glxDisplay); glxDisplay = NULL;
-        return 0;
-    }
-
-    int pbAttribs[] = { GLX_PBUFFER_WIDTH, 16, GLX_PBUFFER_HEIGHT, 16, None };
-    glxPbuffer = glXCreatePbuffer(glxDisplay, fbConfigs[0], pbAttribs);
-    XFree(fbConfigs);
-    if (!glxPbuffer) {
-        DBG("GLX: pbuffer creation failed\n");
-        glXDestroyContext(glxDisplay, glxContext); glxContext = NULL;
-        XCloseDisplay(glxDisplay); glxDisplay = NULL;
-        return 0;
-    }
-
-    if (!glXMakeContextCurrent(glxDisplay, glxPbuffer, glxPbuffer, glxContext)) {
-        DBG("GLX: MakeContextCurrent failed\n");
-        glXDestroyPbuffer(glxDisplay, glxPbuffer); glxPbuffer = 0;
-        glXDestroyContext(glxDisplay, glxContext); glxContext = NULL;
-        XCloseDisplay(glxDisplay); glxDisplay = NULL;
-        return 0;
-    }
-
-    const char *glVersion = (const char *)glGetString(GL_VERSION);
-    const char *glRenderer = (const char *)glGetString(GL_RENDERER);
-    DBG("GLX: initialized (GL=%s renderer=%s)\n",
-        glVersion ? glVersion : "null", glRenderer ? glRenderer : "null");
-
-    /* Unbind — render thread will rebind */
-    glXMakeContextCurrent(glxDisplay, None, None, NULL);
-
-    /* Open DRM render node for mpv hw decode interop */
-    if (task->gbmFd <= 0) {
-        static const char *nodes[] = {"/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/renderD130", NULL};
-        for (int i = 0; nodes[i]; i++) {
-            int fd = open(nodes[i], O_RDWR);
-            if (fd >= 0) { task->gbmFd = fd; break; }
-        }
-    }
-
-    DBG("GLX: context ready (drmFd=%d)\n", task->gbmFd);
-    return 1;
-}
-
-static void glxMakeCurrent(void) {
-    if (glxDisplay && glxContext && glxPbuffer) {
-        glXMakeContextCurrent(glxDisplay, glxPbuffer, glxPbuffer, glxContext);
-    }
-}
-
-static void glxUnbind(void) {
-    if (glxDisplay) {
-        glXMakeContextCurrent(glxDisplay, None, None, NULL);
-    }
-}
-
-static void *glGetProcAddressWrapper(void *ctx, const char *name) {
-    (void)ctx;
-    void *addr = (void *)eglGetProcAddress(name);
-    if (!addr) addr = (void *)glXGetProcAddressARB((const GLubyte *)name);
-    return addr;
-}
-
-/* Make GL context current — dispatches to EGL or GLX */
-static int makeGLCurrent(CreateTask *task) {
-    if (task->useGLX) {
-        glxMakeCurrent();
+    /* Try Wayland EGL first (test) */
+    if (initEGL_Wayland(task)) {
         return 1;
     }
-    return eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext);
-}
 
-static void unbindGL(CreateTask *task) {
-    if (task->useGLX) {
-        glxUnbind();
+    /* Try render nodes — on multi-GPU systems, find one that works.
+     * renderD128 may be AMD iGPU while renderD129 is NVIDIA dGPU. */
+    static const char *renderNodes[] = {
+        "/dev/dri/renderD128",
+        "/dev/dri/renderD129",
+        "/dev/dri/renderD130",
+        NULL
+    };
+
+    for (int nodeIdx = 0; renderNodes[nodeIdx]; nodeIdx++) {
+        int origFd = open(renderNodes[nodeIdx], O_RDWR);
+        if (origFd < 0) continue;
+
+        task->gbmFd = dup(origFd);
+        close(origFd);
+        if (task->gbmFd < 0) continue;
+
+        task->gbmDevice = gbm_create_device(task->gbmFd);
+        if (!task->gbmDevice) {
+            close(task->gbmFd);
+            task->gbmFd = -1;
+            continue;
+        }
+        DBG("EGL: trying render node %s\n", renderNodes[nodeIdx]);
+
+    PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+
+    if (eglGetPlatformDisplayEXT) {
+        task->eglDisplay = eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR, task->gbmDevice, NULL);
     } else {
-        eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        task->eglDisplay = eglGetDisplay((EGLNativeDisplayType)task->gbmDevice);
     }
+
+    if (task->eglDisplay == EGL_NO_DISPLAY) {
+        DBG("EGL: failed to get EGL display from GBM\n");
+        gbm_device_destroy(task->gbmDevice);
+        close(task->gbmFd);
+        task->gbmFd = -1;
+        task->gbmDevice = NULL;
+        continue;
+    }
+
+    EGLint major, minor;
+    if (!eglInitialize(task->eglDisplay, &major, &minor)) {
+        DBG("EGL: eglInitialize failed\n");
+        gbm_device_destroy(task->gbmDevice);
+        close(task->gbmFd);
+        task->gbmFd = -1;
+        task->gbmDevice = NULL;
+        task->eglDisplay = EGL_NO_DISPLAY;
+        continue;
+    }
+    DBG("EGL: initialized %d.%d via GBM\n", major, minor);
+
+    /* Try OpenGL ES first (NVIDIA GBM supports GLES surfaceless better than GL) */
+    int useGLES = 0;
+    eglBindAPI(EGL_OPENGL_API);
+
+    EGLint configAttribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint numConfigs;
+    if (!eglChooseConfig(task->eglDisplay, configAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+        DBG("EGL: GL config failed, trying GLES\n");
+        eglBindAPI(EGL_OPENGL_ES_API);
+        EGLint glesConfigAttribs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        };
+        if (!eglChooseConfig(task->eglDisplay, glesConfigAttribs, &config, 1, &numConfigs) || numConfigs == 0) {
+            DBG("EGL: eglChooseConfig failed (both GL and GLES)\n");
+            eglTerminate(task->eglDisplay);
+            gbm_device_destroy(task->gbmDevice);
+            close(task->gbmFd);
+            task->gbmFd = -1;
+            task->gbmDevice = NULL;
+            task->eglDisplay = EGL_NO_DISPLAY;
+            continue;
+        }
+        useGLES = 1;
+    }
+
+    EGLContext ctx = EGL_NO_CONTEXT;
+    if (!useGLES) {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3,
+                                EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                                EGL_NONE };
+        ctx = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs);
+        if (ctx == EGL_NO_CONTEXT) {
+            EGLint ctxAttribs2[] = { EGL_NONE };
+            ctx = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs2);
+        }
+    } else {
+        EGLint ctxAttribs[] = { EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE };
+        ctx = eglCreateContext(task->eglDisplay, config, EGL_NO_CONTEXT, ctxAttribs);
+    }
+    if (ctx == EGL_NO_CONTEXT) {
+        DBG("EGL: eglCreateContext failed (error=0x%x)\n", eglGetError());
+        eglTerminate(task->eglDisplay);
+        gbm_device_destroy(task->gbmDevice);
+        close(task->gbmFd);
+        task->gbmFd = -1;
+        task->gbmDevice = NULL;
+        task->eglDisplay = EGL_NO_DISPLAY;
+        continue;
+    }
+    task->eglContext = ctx;
+
+    /* Try pbuffer first (works on NVIDIA EGL Device platform),
+     * then surfaceless (works on Mesa/Intel/AMD GBM) */
+    EGLint pbufAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    task->eglSurface = eglCreatePbufferSurface(task->eglDisplay, config, pbufAttribs);
+    if (task->eglSurface == EGL_NO_SURFACE) {
+        DBG("EGL: pbuffer creation failed (non-fatal, will try surfaceless)\n");
+        task->eglSurface = EGL_NO_SURFACE;
+    }
+
+    /* Verify eglMakeCurrent works NOW (same thread) — catch NVIDIA issues early */
+    EGLSurface testSurf = (task->eglSurface != EGL_NO_SURFACE) ? task->eglSurface : EGL_NO_SURFACE;
+    if (!eglMakeCurrent(task->eglDisplay, testSurf, testSurf, task->eglContext)) {
+        EGLint err = eglGetError();
+        DBG("EGL: GBM eglMakeCurrent pre-check failed (err=0x%x), trying NVIDIA vendor lib\n", err);
+        /* GBM path doesn't work (NVIDIA). Try NVIDIA vendor library directly. */
+        eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroyContext(task->eglDisplay, task->eglContext);
+        if (task->eglSurface != EGL_NO_SURFACE) eglDestroySurface(task->eglDisplay, task->eglSurface);
+        eglTerminate(task->eglDisplay);
+        gbm_device_destroy(task->gbmDevice);
+        /* Keep gbmFd open for DRM params */
+        task->eglDisplay = EGL_NO_DISPLAY;
+        task->eglContext = EGL_NO_CONTEXT;
+        task->eglSurface = EGL_NO_SURFACE;
+        task->gbmDevice = NULL;
+
+        if (initEGL_NvidiaVendor(task)) {
+            return 1;
+        }
+        if (initEGL_Wayland(task)) {
+            return 1;
+        }
+        if (initEGL_SharedContext(task)) {
+            return 1;
+        }
+        if (initEGL_DevicePlatform(task)) {
+            return 1;
+        }
+        /* All fallbacks failed for this node — try next */
+        close(task->gbmFd);
+        task->gbmFd = -1;
+        continue;
+    }
+    /* Success — unbind for now, render thread will re-bind */
+    eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+    DBG("EGL: GBM context created successfully (surface=%s, api=%s)\n",
+        task->eglSurface != EGL_NO_SURFACE ? "pbuffer" : "surfaceless",
+        useGLES ? "GLES" : "GL");
+    return 1;
+
+    } /* end for nodeIdx */
+
+    DBG("EGL: all render nodes exhausted\n");
+    return 0;
 }
 
 static void ensureFBO(CreateTask *task, int w, int h) {
@@ -395,6 +1102,11 @@ static void destroyEGL(CreateTask *task) {
     task->fboTex = 0;
 }
 
+static void *glGetProcAddressWrapper(void *ctx, const char *name) {
+    (void)ctx;
+    return (void *)eglGetProcAddress(name);
+}
+
 /* ------------------------------------------------------------------ */
 /*  GL offscreen render                                                */
 /* ------------------------------------------------------------------ */
@@ -415,8 +1127,8 @@ static void renderFrameGL(CreateTask *task) {
         h = (int)vh;
     }
 
-    if (!makeGLCurrent(task)) {
-        DBG("renderFrameGL: makeGLCurrent failed\n");
+    if (!eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext)) {
+        DBG("renderFrameGL: eglMakeCurrent failed (error=0x%x)\n", eglGetError());
         return;
     }
     ensureFBO(task, w, h);
@@ -507,35 +1219,36 @@ static void mpvWakeupCallback(void *data) {
 static void *renderThreadFunc(void *data) {
     CreateTask *task = (CreateTask *)data;
 
-    /* If gpuMode==2, create GL render context here where we own the GL context. */
+    /* If gpuMode==2, create GL render context here where we own the EGL context.
+     * This allows mpv to see eglGetCurrentDisplay() and init VAAPI interop. */
     if (task->gpuMode == 2 && !task->renderCtx) {
-        /* Try EGL first, then GLX as fallback */
-        if (task->eglDisplay == EGL_NO_DISPLAY && !task->useGLX) {
+        /* Init EGL on this thread if not cached (NVIDIA requires same-thread create+MakeCurrent) */
+        if (task->eglDisplay == EGL_NO_DISPLAY) {
             if (!initEGL(task)) {
-                DBG("render thread: EGL failed, trying GLX\n");
-                if (initGLX(task)) {
-                    task->useGLX = 1;
-                } else {
-                    DBG("render thread: GLX also failed, falling back to SW\n");
-                    task->gpuMode = 0;
-                    int adv = 1;
-                    mpv_render_param sw_params[] = {
-                        {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_SW},
-                        {MPV_RENDER_PARAM_ADVANCED_CONTROL, &adv},
-                        {0}
-                    };
-                    mpv_render_context_create(&task->renderCtx, task->mpv, sw_params);
-                    if (task->renderCtx) {
-                        mpv_render_context_set_update_callback(task->renderCtx, mpvWakeupCallback, task);
-                        mpv_set_property_string(task->mpv, "hwdec", "auto-copy");
-                    }
-                    goto render_loop;
+                DBG("render thread: initEGL FAILED, falling back to SW\n");
+                task->gpuMode = 0;
+                int adv = 1;
+                mpv_render_param sw_params[] = {
+                    {MPV_RENDER_PARAM_API_TYPE, MPV_RENDER_API_TYPE_SW},
+                    {MPV_RENDER_PARAM_ADVANCED_CONTROL, &adv},
+                    {0}
+                };
+                mpv_render_context_create(&task->renderCtx, task->mpv, sw_params);
+                if (task->renderCtx) {
+                    mpv_render_context_set_update_callback(task->renderCtx, mpvWakeupCallback, task);
+                    mpv_set_property_string(task->mpv, "hwdec", "auto-copy");
                 }
+                goto render_loop;
             }
         }
-
-        if (!makeGLCurrent(task)) {
-            DBG("render thread: makeGLCurrent FAILED, falling back to SW\n");
+        EGLBoolean mkRes = eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext);
+        DBG("render thread: eglMakeCurrent=%d (err=0x%x)\n", mkRes, mkRes ? 0 : eglGetError());
+        if (mkRes) {
+            const char *glVersion = (const char *)glGetString(GL_VERSION);
+            const char *glRenderer = (const char *)glGetString(GL_RENDERER);
+            DBG("render thread: GL=%s renderer=%s\n", glVersion ? glVersion : "null", glRenderer ? glRenderer : "null");
+        } else {
+            DBG("render thread: eglMakeCurrent FAILED, falling back to SW\n");
             task->gpuMode = 0;
             int adv = 1;
             mpv_render_param sw_params[] = {
@@ -550,13 +1263,6 @@ static void *renderThreadFunc(void *data) {
             }
             goto render_loop;
         }
-
-        const char *glVersion = (const char *)glGetString(GL_VERSION);
-        const char *glRenderer = (const char *)glGetString(GL_RENDERER);
-        DBG("render thread: GL=%s renderer=%s (backend=%s)\n",
-            glVersion ? glVersion : "null", glRenderer ? glRenderer : "null",
-            task->useGLX ? "GLX" : "EGL");
-
         DBG("render thread: creating mpv GL render context (gbmFd=%d)\n", task->gbmFd);
 
 
@@ -626,8 +1332,8 @@ gl_create_failed:
             }
             }
     } else if (task->gpuMode == 2 && task->renderCtx) {
-        /* Cached path: render context already exists, just activate GL */
-        makeGLCurrent(task);
+        /* Cached path: render context already exists, just activate EGL */
+        eglMakeCurrent(task->eglDisplay, task->eglSurface, task->eglSurface, task->eglContext);
         mpv_render_context_set_update_callback(task->renderCtx, mpvWakeupCallback, task);
         DBG("render thread: reusing cached GL context\n");
     }
@@ -664,9 +1370,9 @@ render_loop:
         }
     }
 
-    /* Unbind GL context from render thread */
-    if (task->gpuMode == 2) {
-        unbindGL(task);
+    /* Unbind EGL context from render thread */
+    if (task->gpuMode == 2 && task->eglDisplay != EGL_NO_DISPLAY) {
+        eglMakeCurrent(task->eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     }
 
     return NULL;
@@ -791,13 +1497,14 @@ static char *tracks_json_for_type(mpv_handle *mpv, const char *type) {
 /* ------------------------------------------------------------------ */
 JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
     JNIEnv *env, jobject thiz,
-    jlong hostViewPtr,
+    jlong hostViewPtr, jint hostWidth, jint hostHeight,
     jstring sourceUrl,
     jobjectArray headerLines, jboolean playWhenReady, jlong initialPositionMs,
     jstring controlsPageUrl,
     jint decoderPriority, jboolean nvidiaRtxSuperResolutionEnabled,
     jobject eventSink) {
     (void)thiz;
+    (void)hostWidth; (void)hostHeight;
     (void)decoderPriority; (void)nvidiaRtxSuperResolutionEnabled;
     (void)hostViewPtr; /* gpuMode=1 (wid) removed — Linux always uses offscreen */
 
@@ -810,6 +1517,15 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
     task->alive = 1;
     task->gpuMode = 0;
     task->eglDisplay = EGL_NO_DISPLAY;
+
+    /* Capture Skia/Compose's EGL display from JNI thread for shared context fallback.
+     * On NVIDIA, creating a new display fails but reusing Skia's works. */
+    task->skiaDisplay = eglGetCurrentDisplay();
+    if (task->skiaDisplay == EGL_NO_DISPLAY) {
+        /* Try default display — NVIDIA shares it process-wide */
+        task->skiaDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    }
+    DBG("create: captured skiaDisplay=%p\n", (void*)task->skiaDisplay);
 
     pthread_mutex_init(&task->frameMutex, NULL);
     pthread_cond_init(&task->frameCond, NULL);
@@ -852,71 +1568,29 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
         return 0;
     }
 
-    /* GL offscreen */
+    /* GL offscreen — restore cached EGL/GBM or defer EGL init to render thread */
     pthread_mutex_lock(&glCacheMutex);
     if (glCache.valid) {
-        DBG("create: reusing cached GL instance\n");
+        DBG("create: reusing cached EGL/GBM instance\n");
         task->gbmFd = glCache.gbmFd;
         task->gbmDevice = glCache.gbmDevice;
         task->eglDisplay = glCache.eglDisplay;
         task->eglContext = glCache.eglContext;
-        task->eglSurface = glCache.eglSurface;
-        task->useGLX = glCache.useGLX;
-        task->fbo = glCache.fbo;
-        task->fboTex = glCache.fboTex;
-        task->fboW = glCache.fboW;
-        task->fboH = glCache.fboH;
-        if (glCache.mpv && glCache.renderCtx) {
-            mpv_terminate_destroy(task->mpv);
-            task->mpv = glCache.mpv;
-            task->renderCtx = glCache.renderCtx;
-        }
         glCache.valid = 0;
-        glCache.mpv = NULL;
-        glCache.renderCtx = NULL;
         pthread_mutex_unlock(&glCacheMutex);
         task->gpuMode = 2;
-        DBG("create: cached GL instance restored\n");
+        DBG("create: cached EGL/GBM restored (fresh mpv will be created)\n");
     } else {
         pthread_mutex_unlock(&glCacheMutex);
         /* Defer EGL init to render thread — NVIDIA GBM/EGL doesn't support
          * context creation on one thread + MakeCurrent on another. */
         task->gpuMode = 2;
-        mpv_set_option_string(task->mpv, "vo", "libmpv");
-        mpv_set_option_string(task->mpv, "gpu-api", "opengl");
         DBG("create: offscreen GL mode, EGL deferred to render thread\n");
     }
 
-    int reusingCachedMpv = (task->gpuMode == 2 && task->renderCtx != NULL);
-
-    if (reusingCachedMpv) {
-        DBG("create: reusing cached mpv, skipping init\n");
-        if (task->nheaders > 0 && task->headers) {
-            size_t len = 0;
-            for (int i = 0; i < task->nheaders; i++)
-                if (task->headers[i]) len += strlen(task->headers[i]) * 2 + 2;
-            if (len > 0) {
-                char *hdr = malloc(len + 1);
-                hdr[0] = '\0';
-                for (int i = 0; i < task->nheaders; i++) {
-                    if (!task->headers[i]) continue;
-                    if (hdr[0] != '\0') strcat(hdr, ",");
-                    const char *src = task->headers[i];
-                    char *dst = hdr + strlen(hdr);
-                    while (*src) {
-                        if (*src == '\\' || *src == ',') *dst++ = '\\';
-                        *dst++ = *src++;
-                    }
-                    *dst = '\0';
-                }
-                mpv_set_property_string(task->mpv, "http-header-fields", hdr);
-                free(hdr);
-            }
-        }
-        mpv_render_context_set_update_callback(task->renderCtx, mpvWakeupCallback, task);
-        /* Cached path: start render thread then jump to loadfile */
-        pthread_create(&task->renderThread, NULL, renderThreadFunc, task);
-        goto skip_init;
+    if (task->gpuMode == 2) {
+        mpv_set_option_string(task->mpv, "vo", "libmpv");
+        mpv_set_option_string(task->mpv, "gpu-api", "opengl");
     }
 
     /* -- Common options -- */
@@ -926,7 +1600,7 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
     mpv_set_option_string(task->mpv, "demuxer-max-back-bytes", "25M");
     mpv_set_option_string(task->mpv, "audio-file-auto", "no");
     mpv_set_option_string(task->mpv, "sub-auto", "no");
-    mpv_set_option_string(task->mpv, "config", "yes");
+    mpv_set_option_string(task->mpv, "config", "no");
     mpv_set_option_string(task->mpv, "terminal", "no");
     mpv_set_option_string(task->mpv, "msg-level", "all=no");
 
@@ -1033,7 +1707,6 @@ JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerB
         }
     }
 
-skip_init:
     if (task->sourceUrl) {
         if (initialPositionMs > 0) {
             char startOpt[80];
@@ -1064,49 +1737,30 @@ JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBr
     pthread_cond_signal(&task->frameCond);
 
     if (task->gpuMode == 2) {
-        /* Detach render callback first to prevent new frames during shutdown */
-        if (task->renderCtx) {
-            mpv_render_context_set_update_callback(task->renderCtx, NULL, NULL);
-        }
-        /* NVIDIA/GLX dispose ordering — fixes a hard deadlock:
-         * The render thread owns the GLX context. If we send mpv "stop" first, mpv's
-         * core thread tears down the decoder (vd_lavc_destroy -> vkDestroyDevice) on the
-         * NVIDIA driver WHILE the render thread is still doing GL work on the same
-         * context — both threads then block forever inside libnvidia-glcore, and
-         * dispose() hangs on pthread_join (player "won't die", app won't close).
-         * So: join the render thread FIRST (it finishes its frame, unbinds the GL
-         * context via glXMakeCurrent(None), and exits), THEN stop playback — no
-         * concurrent GL/VK teardown on the driver. */
-        pthread_cond_signal(&task->frameCond);
-        if (task->renderThread) pthread_join(task->renderThread, NULL);
         if (task->mpv) {
             const char *cmd[] = {"stop", NULL};
             mpv_command(task->mpv, cmd);
             mpv_wakeup(task->mpv);
         }
+        if (task->renderThread) pthread_join(task->renderThread, NULL);
 
-        /* Cache for reuse — do NOT free mpv/renderCtx (crashes Gallium) */
+        /* Destroy render context and mpv — create fresh ones next session */
+        if (task->renderCtx) { mpv_render_context_free(task->renderCtx); task->renderCtx = NULL; }
+        if (task->mpv) { mpv_terminate_destroy(task->mpv); task->mpv = NULL; }
+        if (task->fbo) { glDeleteFramebuffers(1, &task->fbo); glDeleteTextures(1, &task->fboTex); task->fbo = 0; task->fboTex = 0; }
+
+        /* Cache EGL/GBM state for reuse — avoids Gallium pipe_screen leak */
         pthread_mutex_lock(&glCacheMutex);
         glCache.valid = 1;
-        glCache.useGLX = task->useGLX;
         glCache.gbmFd = task->gbmFd;
         glCache.gbmDevice = task->gbmDevice;
         glCache.eglDisplay = task->eglDisplay;
         glCache.eglContext = task->eglContext;
-        glCache.eglSurface = task->eglSurface;
-        glCache.mpv = task->mpv;
-        glCache.renderCtx = task->renderCtx;
-        glCache.fbo = task->fbo;
-        glCache.fboTex = task->fboTex;
-        glCache.fboW = task->fboW;
-        glCache.fboH = task->fboH;
         pthread_mutex_unlock(&glCacheMutex);
 
-        task->renderCtx = NULL;
-        task->mpv = NULL;
         task->eglDisplay = EGL_NO_DISPLAY;
         task->eglContext = EGL_NO_CONTEXT;
-        DBG("dispose: GL instance cached for reuse\n");
+        DBG("dispose: EGL/GBM cached, mpv destroyed\n");
     } else {
         if (task->mpv) mpv_wakeup(task->mpv);
         if (task->renderThread) pthread_join(task->renderThread, NULL);
@@ -1193,28 +1847,7 @@ JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBr
 
 JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setResizeMode(JNIEnv *env, jobject thiz, jlong hdl, jint mode) {
     (void)env; (void)thiz; CreateTask *task = getTask(hdl); if (!task || !task->mpv) return;
-    /* mode: 0=Fit, 1=Fill, 2=Zoom, 3=Stretch */
-    DBG("setResizeMode: mode=%d\n", mode);
-
-    const char *panscan = "0.0";
-    const char *keepaspect = "yes";
-    switch (mode) {
-    case 1: /* Fill */
-    case 2: /* Zoom */
-        panscan = "1.0";
-        break;
-    case 3: /* Stretch */
-        keepaspect = "no";
-        break;
-    default: /* Fit */
-        break;
-    }
-    mpv_set_property_string(task->mpv, "keepaspect", keepaspect);
-    mpv_set_property_string(task->mpv, "panscan", panscan);
-    mpv_set_property_string(task->mpv, "video-unscaled", "no");
-    mpv_set_property_string(task->mpv, "video-aspect-override", "no");
-    mpv_set_property_string(task->mpv, "sub-use-margins", (mode == 0 || mode == 1 || mode == 2) ? "yes" : "no");
-    mpv_set_property_string(task->mpv, "sub-pos", "100");
+    mpv_set_property_string(task->mpv, "panscan", mode == 1 ? "1.0" : "0.0");
 }
 
 JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_durationMs(JNIEnv *env, jobject thiz, jlong hdl) {
@@ -1506,4 +2139,23 @@ JNIEXPORT jboolean JNICALL Java_com_nuvio_app_features_player_desktop_NativePlay
     (*env)->ReleaseByteArrayElements(env, dstBytes, dst, 0);
     pthread_mutex_unlock(&task->frameMutex);
     return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_isWaylandSession(
+    JNIEnv *env, jobject thiz) {
+    (void)env; (void)thiz;
+    const char *session = getenv("XDG_SESSION_TYPE");
+    const char *display = getenv("WAYLAND_DISPLAY");
+    return (session && strstr(session, "wayland")) || (display && display[0]) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_requestFocus(
+    JNIEnv *env, jobject thiz, jlong hdl) {
+    (void)env; (void)thiz; (void)hdl;
+}
+
+JNIEXPORT jlong JNICALL Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_getX11WindowId(
+    JNIEnv *env, jobject thiz, jlong awtPeerPtr) {
+    (void)env; (void)thiz; (void)awtPeerPtr;
+    return 0;
 }

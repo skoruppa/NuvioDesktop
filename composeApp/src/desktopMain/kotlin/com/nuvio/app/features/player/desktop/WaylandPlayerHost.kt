@@ -9,31 +9,29 @@ import java.awt.Point
 import java.awt.Toolkit
 import java.awt.Window
 import java.awt.image.BufferedImage
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import javax.swing.Timer
 
 /**
  * PlayerHost for Linux Wayland sessions where mpv cannot render directly
  * into an X11 window (no wid support). Instead, mpv renders offscreen
  * (EGL FBO via GBM) and this host pulls finished frames via
- * [NativePlayerBridge.renderFrameBytes] into a Skia [Image] that
- * Compose Canvas draws each tick. Double-buffered byte arrays avoid
- * per-frame allocation overhead.
+ * [NativePlayerBridge.renderFrame] into a Skia [Image] that
+ * Compose Canvas draws each tick.
  */
 internal class WaylandPlayerHost : PlayerHost {
     @Volatile
     override var nativeHandle: Long = 0L
 
     override var onMouseClick: (() -> Unit)? = null
-    override var onDoubleClick: (() -> Unit)? = null
     override var onCursorActivity: (() -> Unit)? = null
 
     private var lastWidth = 0
     private var lastHeight = 0
 
-    /* Double-buffer: one being drawn by Compose, other being filled by native. */
-    private var bufferA: ByteArray? = null
-    private var bufferB: ByteArray? = null
-    private var useBufferA = true
+    private var pixelBuffer: IntArray? = null
+    private var pixelBytes: ByteArray? = null
 
     var latestImage: Image? = null
         private set
@@ -46,21 +44,20 @@ internal class WaylandPlayerHost : PlayerHost {
         val handle = nativeHandle
         if (handle == 0L || width <= 0 || height <= 0) return false
 
-        val byteCount = width * height * 4
+        val count = width * height
+        val byteCount = count * 4
 
-        // Use double-buffer: write to inactive buffer while Compose reads from active one
-        val bytes: ByteArray
-        if (useBufferA) {
-            if (bufferA == null || bufferA!!.size < byteCount) bufferA = ByteArray(byteCount)
-            bytes = bufferA!!
-        } else {
-            if (bufferB == null || bufferB!!.size < byteCount) bufferB = ByteArray(byteCount)
-            bytes = bufferB!!
-        }
-        useBufferA = !useBufferA
+        val pix = pixelBuffer?.takeIf { it.size >= count }
+            ?: IntArray(count).also { pixelBuffer = it }
 
-        if (!NativePlayerBridge.renderFrameBytes(handle, bytes, width, height)) return false
-        if (nativeHandle == 0L) return false
+        pix.fill(0)
+
+        if (!NativePlayerBridge.renderFrame(handle, pix, width, height)) return false
+
+        val bytes = pixelBytes?.takeIf { it.size >= byteCount }
+            ?: ByteArray(byteCount).also { pixelBytes = it }
+
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().put(pix, 0, count)
 
         val imageInfo = ImageInfo.makeS32(width, height, ColorAlphaType.UNPREMUL)
         val previousImage = latestImage
@@ -99,8 +96,8 @@ internal class WaylandPlayerHost : PlayerHost {
         resetCursorVisibility()
         latestImage?.close()
         latestImage = null
-        bufferA = null
-        bufferB = null
+        pixelBuffer = null
+        pixelBytes = null
     }
 
     private fun setCursorVisible(visible: Boolean) {

@@ -714,6 +714,8 @@ public:
         long long initialPositionMs,
         const std::string &controlsUrl,
         JavaVM *vm,
+        int decoderPriority,
+        bool nvidiaRtxSuperResolutionEnabled,
         jobject sink,
         jmethodID method
     ) {
@@ -729,8 +731,8 @@ public:
         auto initState = std::make_shared<InitializationState>();
         auto self = shared_from_this();
         uiThread = std::thread(
-            [self, sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, initState]() {
-                self->runNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, initState);
+            [self, sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, initState]() {
+                self->runNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled, initState);
             }
         );
 
@@ -857,12 +859,6 @@ public:
         if (!mpv) return;
         double clamped = std::max(0.25, std::min(4.0, speed));
         mpvApi().setProperty(mpv, "speed", MPV_FORMAT_DOUBLE, &clamped);
-    }
-
-    void setMpvProperty(const char *name, const char *value) {
-        std::lock_guard<std::mutex> lock(mpvMutex);
-        if (!mpv) return;
-        mpvApi().setPropertyString(mpv, name, value);
     }
 
     double speed() {
@@ -1013,7 +1009,7 @@ public:
             std::lock_guard<std::mutex> lock(mpvMutex);
             if (!mpv) return;
             double outline = std::max(0.0, std::min(8.0, outlineSize));
-            double size = std::max(24.0, std::min(96.0, fontSize));
+            double size = std::max(18.0, std::min(96.0, fontSize));
             int64_t position = std::max(0, std::min(150, subPos));
             mpvApi().setProperty(mpv, "sub-outline-size", MPV_FORMAT_DOUBLE, &outline);
             mpvApi().setProperty(mpv, "sub-font-size", MPV_FORMAT_DOUBLE, &size);
@@ -1043,6 +1039,7 @@ private:
     std::thread eventThread;
     std::atomic_bool stopping = false;
     std::atomic_bool shuttingDown = false;
+    std::atomic_bool hwdecLogged = false;  // one-shot log for hwdec-current
 
     JavaVM *javaVm = nullptr;
     jobject eventSink = nullptr;
@@ -1062,11 +1059,13 @@ private:
         bool playWhenReady,
         long long initialPositionMs,
         std::string controlsUrl,
+        int decoderPriority,
+        bool nvidiaRtxSuperResolutionEnabled,
         std::shared_ptr<InitializationState> initState
     ) {
         std::string failure;
         try {
-            initializeOnNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl);
+            initializeOnNativeUiThread(sourceUrl, headerLines, playWhenReady, initialPositionMs, controlsUrl, decoderPriority, nvidiaRtxSuperResolutionEnabled);
         } catch (const std::exception &error) {
             failure = error.what();
             cleanupUiResources();
@@ -1095,7 +1094,9 @@ private:
         const std::vector<std::string> &headerLines,
         bool playWhenReady,
         long long initialPositionMs,
-        const std::string &controlsUrl
+        const std::string &controlsUrl,
+        int decoderPriority,
+        bool nvidiaRtxSuperResolutionEnabled
     ) {
         registerWindowClasses();
         uiThreadId = GetCurrentThreadId();
@@ -1147,7 +1148,7 @@ private:
         }
 
         startWebView(controlsUrl);
-        startMpv(sourceUrl, headerLines, playWhenReady, initialPositionMs);
+        startMpv(sourceUrl, headerLines, playWhenReady, initialPositionMs, decoderPriority, nvidiaRtxSuperResolutionEnabled);
         layoutNativeSubviews();
         if (!SetTimer(messageHwnd, NUVIO_TIMER_ID, 500, nullptr)) {
             throw std::runtime_error("Unable to start native player timer.");
@@ -1332,7 +1333,9 @@ private:
         const std::string &sourceUrl,
         const std::vector<std::string> &headerLines,
         bool playWhenReady,
-        long long initialPositionMs
+        long long initialPositionMs,
+        int decoderPriority,
+        bool nvidiaRtxSuperResolutionEnabled
     ) {
         MpvApi &api = mpvApi();
         {
@@ -1343,16 +1346,33 @@ private:
             }
             initialStartSeconds = initialPositionMs > 0 ? (double)initialPositionMs / 1000.0 : 0.0;
 
-            setMpvOptionStringLocked("config", "yes");
+            setMpvOptionStringLocked("config", "no");
             setMpvOptionStringLocked("osc", "no");
             setMpvOptionStringLocked("input-default-bindings", "yes");
             setMpvOptionStringLocked("input-vo-keyboard", "no");
             setMpvOptionStringLocked("keep-open", "yes");
             setMpvOptionStringLocked("vo", "gpu-next");
             setMpvOptionStringLocked("gpu-api", "d3d11");
-            setMpvOptionStringLocked("hwdec", "d3d11va");
+            if (nvidiaRtxSuperResolutionEnabled) {
+                setMpvOptionStringLocked("hwdec", "d3d11va");
+                setMpvOptionStringLocked("d3d11-adapter", "NVIDIA");
+            } else {
+                setMpvOptionStringLocked("hwdec", "auto");
+            }
             setMpvOptionStringLocked("hwdec-codecs", "all");
-            setMpvOptionStringLocked("vd-lavc-software-fallback", "no");
+
+            if (nvidiaRtxSuperResolutionEnabled) {
+                setMpvOptionStringLocked("vf", "d3d11vpp=scale=2:scaling-mode=nvidia");
+            }
+            setMpvOptionStringLocked("target-colorspace-hint", "yes");
+            if (decoderPriority == 0) {
+                setMpvOptionStringLocked("vd-lavc-software-fallback", "no");
+            } else if (decoderPriority == 2) {
+                setMpvOptionStringLocked("hwdec", "no");
+                setMpvOptionStringLocked("vd-lavc-software-fallback", "yes");
+            } else {
+                setMpvOptionStringLocked("vd-lavc-software-fallback", "yes");
+            }
             setMpvOptionStringLocked("vd-lavc-threads", "4");
             setMpvOptionStringLocked("tone-mapping", "auto");
             setMpvOptionStringLocked("dither-depth", "auto");
@@ -1943,10 +1963,10 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
     jboolean playWhenReady,
     jlong initialPositionMs,
     jstring controlsPageUrl,
-    jint decoderPriority, jboolean nvidiaRtxSuperResolutionEnabled,
+    jint decoderPriority,
+    jboolean nvidiaRtxSuperResolutionEnabled,
     jobject eventSink
 ) {
-    (void)decoderPriority; (void)nvidiaRtxSuperResolutionEnabled;
     HWND hostHwnd = (HWND)(intptr_t)hostViewPtr;
     std::string sourceUrlText = jstringToUtf8(env, sourceUrl);
     std::vector<std::string> headerLineValues = jstringArrayToVector(env, headerLines);
@@ -1978,6 +1998,8 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_create(
             initialPositionMs,
             controlsPageUrlText,
             javaVm,
+            decoderPriority,
+            nvidiaRtxSuperResolutionEnabled == JNI_TRUE,
             eventSinkRef,
             eventMethod
         );
@@ -2227,39 +2249,4 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_applySubtitleStyle
         fontSize,
         subPos
     );
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setProperty(
-    JNIEnv *env,
-    jobject,
-    jlong handle,
-    jstring name,
-    jstring value
-) {
-    auto player = playerFromHandle(handle);
-    if (!player) return;
-    player->setMpvProperty(jstringToUtf8(env, name).c_str(), jstringToUtf8(env, value).c_str());
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_renderFrame(
-    JNIEnv *,
-    jobject,
-    jlong,
-    jintArray,
-    jint,
-    jint
-) {
-    return JNI_FALSE;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_resizeNativeView(
-    JNIEnv *,
-    jobject,
-    jlong,
-    jint,
-    jint
-) {
 }

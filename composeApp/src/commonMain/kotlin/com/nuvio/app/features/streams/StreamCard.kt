@@ -40,7 +40,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
-import com.nuvio.app.core.ui.nuvioDesktopDragScroll
 import com.nuvio.app.features.debrid.DebridProviders
 
 @Composable
@@ -175,12 +174,8 @@ private fun StreamCardBadgeRow(
     showFileSizeBadges: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    val scrollState = rememberScrollState()
-
     Row(
-        modifier = modifier
-            .nuvioDesktopDragScroll(scrollState)
-            .horizontalScroll(scrollState),
+        modifier = modifier.horizontalScroll(rememberScrollState()),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {

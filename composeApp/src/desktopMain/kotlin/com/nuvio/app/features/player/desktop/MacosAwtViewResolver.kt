@@ -9,6 +9,7 @@ internal object AwtNativeViewResolver {
         when (DesktopHostOs.current) {
             DesktopHostOs.MACOS -> MacosAwtViewResolver.resolveNativeViewPointer(component)
             DesktopHostOs.WINDOWS -> WindowsAwtViewResolver.resolveNativeViewPointer(component)
+            DesktopHostOs.LINUX -> LinuxAwtViewResolver.resolveNativeViewPointer(component)
             else -> error("Native desktop playback is not implemented for ${DesktopHostOs.current}.")
         }
 }
@@ -81,4 +82,59 @@ private object WindowsAwtViewResolver {
         (findMethod(target.javaClass, methodName).invoke(target) as Number).toLong()
 }
 
+/**
+ * Linux X11: resolves the native X11 Window ID from AWT peer.
+ * This allows mpv to render directly into the X11 window with vo=gpu-next,
+ * bypassing the expensive CPU frame copy pipeline.
+ */
+private object LinuxAwtViewResolver {
+    private val componentPeerField: Field by lazy {
+        Component::class.java.getDeclaredField("peer").apply { isAccessible = true }
+    }
 
+    /* Method names to try for X11 window ID resolution — varies by JDK */
+    private val x11MethodNames = listOf("getWindow", "getContentWindow", "getWidget")
+
+    fun resolveNativeViewPointer(component: Component): Long {
+        if (DesktopHostOs.isWayland) {
+            error("GPU-direct wid mode is not supported on Wayland; use SW rendering fallback.")
+        }
+
+        val peer = componentPeerField.get(component)
+            ?: error("AWT component peer is not ready for native playback.")
+
+        /* Try multiple method names for X11 window ID — varies by JDK version */
+        for (methodName in x11MethodNames) {
+            try {
+                val pointer = invokeLong(peer, methodName)
+                if (pointer != 0L) {
+                    return pointer
+                }
+            } catch (_: Exception) {
+                /* Try next method name */
+            }
+        }
+
+        /* Last resort: try JAWT-based resolution via JNI */
+        try {
+            val pointer = NativePlayerBridge.getX11WindowId(0L)
+            if (pointer != 0L) return pointer
+        } catch (_: Exception) { }
+
+        error("Linux AWT X11 window pointer could not be resolved. Peer=${peer.javaClass.simpleName}, methods tried: $x11MethodNames")
+    }
+
+    private fun findMethod(type: Class<*>, name: String): Method {
+        var current: Class<*>? = type
+        while (current != null) {
+            runCatching {
+                return current.getDeclaredMethod(name).apply { isAccessible = true }
+            }
+            current = current.superclass
+        }
+        error("Method $name was not found on ${type.name}.")
+    }
+
+    private fun invokeLong(target: Any, methodName: String): Long =
+        (findMethod(target.javaClass, methodName).invoke(target) as Number).toLong()
+}

@@ -4,42 +4,42 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.requiredSize
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.collectAsState
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.awt.SwingPanel
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.asSkiaBitmap
+import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.dp
+import com.nuvio.app.features.player.desktop.AwtNativePlayerHost
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
 import com.nuvio.app.features.player.desktop.NativePlayerController
+import com.nuvio.app.features.player.desktop.LinuxPlayerSurface
 import com.nuvio.app.features.player.desktop.NativePlayerHost
-import com.nuvio.app.features.player.desktop.LinuxPlayerHost
-import com.nuvio.app.features.player.desktop.desktopFullscreenChanges
 import com.nuvio.app.features.player.desktop.toggleDesktopAppFullscreen
 import java.awt.AWTEvent
 import java.awt.Toolkit
 import java.awt.event.AWTEventListener
 import java.awt.event.MouseEvent
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.drop
 
 @Composable
 actual fun PlatformPlayerSurface(
@@ -65,10 +65,6 @@ actual fun PlatformPlayerSurface(
     onError: (String?) -> Unit,
 ) {
     if (DesktopHostOs.current == DesktopHostOs.LINUX) {
-        // Linux: use offscreen rendering with Compose Canvas overlay.
-        // This ensures player controls render correctly on top of the video.
-        // EGL FBO via GBM (gpuMode=2) with GLES, or SW fallback (gpuMode=0).
-        // GPU decode via hwdec=auto-copy (VAAPI on Intel/AMD, nvdec on NVIDIA).
         LinuxPlayerSurface(
             sourceUrl = sourceUrl,
             sourceHeaders = sourceHeaders,
@@ -86,8 +82,7 @@ actual fun PlatformPlayerSurface(
             onError = onError,
         )
     } else if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS) {
-        // macOS, Windows, and Linux X11: GPU-direct rendering via native view pointer
-        NativePlayerSurface(
+        LegacyAwtNativePlayerSurface(
             sourceUrl = sourceUrl,
             sourceHeaders = sourceHeaders,
             modifier = modifier,
@@ -113,11 +108,13 @@ actual fun PlatformPlayerSurface(
 }
 
 /**
- * Linux path: renders video frames in a Compose [Canvas] so controls overlay correctly.
- * mpv renders offscreen (EGL FBO via GBM or SW fallback), frames are pulled into Skia Image for Canvas.
+ * Linux path: renders video frames in a Compose [Canvas] so controls overlay correctly
+ * without the heavyweight AWT X11 child window problem.
+ * On Wayland, uses optimized SW rendering with gpu-context=wayland for better performance.
  */
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
-private fun LinuxPlayerSurface(
+private fun LinuxComposeSurface(
     sourceUrl: String,
     sourceHeaders: Map<String, String>,
     modifier: Modifier,
@@ -133,11 +130,10 @@ private fun LinuxPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    val host = remember { LinuxPlayerHost() }
+    val host = remember { NativePlayerHost() }
     val controller = remember(host) { NativePlayerController(host) }
     var surfaceSize by remember { mutableStateOf(IntSize.Zero) }
     var frameTick by remember { mutableIntStateOf(0) }
-    var disposed by remember { mutableStateOf(false) }
 
     val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
     val latestOnPlayerControlsEvent = rememberUpdatedState(onPlayerControlsEvent)
@@ -145,35 +141,29 @@ private fun LinuxPlayerSurface(
     val latestOnPlayerControlsScrubFinished = rememberUpdatedState(onPlayerControlsScrubFinished)
     val latestOnError = rememberUpdatedState(onError)
 
-    LaunchedEffect(controller, sourceUrl) {
-        onControllerReady(controller)
-    }
-
     LaunchedEffect(controller) {
-        controller.setControlCallbacks(
-            onAction = { action -> onPlayerControlsAction(action) },
-            onEvent = { type, value -> latestOnPlayerControlsEvent.value(type, value) },
-            onScrubChange = { positionMs -> latestOnPlayerControlsScrubChange.value(positionMs) },
-            onScrubFinished = { positionMs -> latestOnPlayerControlsScrubFinished.value(positionMs) },
-        )
+        onControllerReady(controller)
     }
 
     LaunchedEffect(controller, sourceUrl, playbackHeaders) {
         DesktopPlayerLaunchShield.hideAfter()
         delay(16L)
+        System.err.println("[NUVIO_SURFACE] calling attach()")
         controller.attach(
             sourceUrl = sourceUrl,
             sourceHeaders = playbackHeaders,
             playWhenReady = playWhenReady,
             initialPositionMs = initialPositionMs,
-            decoderPriority = 0,
-            nvidiaRtxSuperResolutionEnabled = false,
             onError = { message -> latestOnError.value(message) },
         )
     }
 
     LaunchedEffect(controller, playWhenReady) {
-        if (playWhenReady) controller.play() else controller.pause()
+        if (playWhenReady) {
+            controller.play()
+        } else {
+            controller.pause()
+        }
     }
 
     LaunchedEffect(controller, resizeMode) {
@@ -190,23 +180,32 @@ private fun LinuxPlayerSurface(
                 onSnapshot(controller.snapshot())
                 delay(500L)
             }
-        } finally { /* coroutine cancelled on dispose */ }
+        } finally {
+            /* coroutine cancelled on dispose */
+        }
     }
 
-    // Frame render loop
+    var lastRenderSize = IntSize.Zero
+
     LaunchedEffect(controller) {
         try {
             while (true) {
-                delay(8)
-                if (disposed) break
+                delay(16)
                 val size = surfaceSize
                 if (host.nativeHandle != 0L && size.width > 0 && size.height > 0) {
-                    if (host.renderFrame(size.width, size.height)) {
+                    val rendered = host.renderFrame(
+                        width = size.width,
+                        height = size.height,
+                    )
+                    if (rendered) {
                         frameTick++
                     }
+                    lastRenderSize = size
                 }
             }
-        } finally { /* coroutine cancelled on dispose */ }
+        } finally {
+            /* coroutine cancelled on dispose */
+        }
     }
 
     DisposableEffect(controller, sourceUrl, playbackHeaders) {
@@ -214,12 +213,7 @@ private fun LinuxPlayerSurface(
     }
 
     DisposableEffect(host) {
-        onDispose {
-            disposed = true
-            host.nativeHandle = 0L
-            host.dispose()
-            frameTick++
-        }
+        onDispose { host.dispose() }
     }
 
     DisposableEffect(Unit) {
@@ -262,40 +256,25 @@ private fun LinuxPlayerSurface(
                 .fillMaxSize()
                 .onSizeChanged { surfaceSize = it },
         ) {
-            frameTick // read to trigger recomposition
-            if (!disposed) {
-                val skiaImage = host.latestImage
-                if (skiaImage != null && !skiaImage.isClosed) {
-                    val canvas = drawContext.canvas.nativeCanvas
-                    val imgW = skiaImage.width.toFloat()
-                    val imgH = skiaImage.height.toFloat()
-                    val dstW = size.width
-                    val dstH = size.height
-
-                    // Draw full FBO — mpv handles letterbox/zoom/stretch internally
-                    // via panscan property. Subtitles are always correctly positioned.
-                    val srcRect = org.jetbrains.skia.Rect.makeWH(imgW, imgH)
-                    val dstRect = org.jetbrains.skia.Rect.makeWH(dstW, dstH)
-                    canvas.drawImageRect(
-                        skiaImage,
-                        srcRect,
-                        dstRect,
-                        org.jetbrains.skia.SamplingMode.DEFAULT,
-                        org.jetbrains.skia.Paint(),
-                        false,
-                    )
-                }
+            frameTick
+            host.latestImage?.toComposeImageBitmap()?.let { imageBitmap ->
+                drawImage(
+                    image = imageBitmap,
+                    dstOffset = IntOffset.Zero,
+                    dstSize = IntSize(size.width.toInt(), size.height.toInt()),
+                )
+                imageBitmap.asSkiaBitmap().close()
             }
         }
     }
 }
 
 /**
- * macOS / Windows / Linux X11 path: uses AWT Canvas + SwingPanel.
- * These platforms get the native view pointer for hardware-accelerated rendering.
+ * macOS / Windows path: uses AWT Canvas + SwingPanel (existing working approach).
+ * These platforms need the native view pointer for hardware-accelerated rendering.
  */
 @Composable
-private fun NativePlayerSurface(
+private fun LegacyAwtNativePlayerSurface(
     sourceUrl: String,
     sourceHeaders: Map<String, String>,
     modifier: Modifier,
@@ -311,45 +290,41 @@ private fun NativePlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    val host = remember { NativePlayerHost() }
+    val host = remember { AwtNativePlayerHost() }
     val controller = remember(host) { NativePlayerController(host) }
-    val hostFirstPaintComplete = remember { mutableStateOf(false) }
-    val hostFirstFullSizePaintComplete = remember { mutableStateOf(false) }
+    val attached = remember { mutableStateOf(false) }
+
     LaunchedEffect(sourceUrl) {
         DesktopPlayerLaunchShield.showForActiveWindow()
     }
+
     val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
     val latestOnPlayerControlsAction = rememberUpdatedState(onPlayerControlsAction)
     val latestOnPlayerControlsEvent = rememberUpdatedState(onPlayerControlsEvent)
     val latestOnPlayerControlsScrubChange = rememberUpdatedState(onPlayerControlsScrubChange)
     val latestOnPlayerControlsScrubFinished = rememberUpdatedState(onPlayerControlsScrubFinished)
     val latestOnError = rememberUpdatedState(onError)
-    val playerSettings by PlayerSettingsRepository.uiState.collectAsState()
-    val decoderPriority = playerSettings.decoderPriority
-    val nvidiaRtxSuperResolutionEnabled = playerSettings.nvidiaRtxSuperResolutionEnabled
 
-    LaunchedEffect(controller, sourceUrl, playbackHeaders) {
+    LaunchedEffect(controller) {
         onControllerReady(controller)
     }
 
     DisposableEffect(host) {
         host.onDisplayableChanged = { displayable ->
             if (!displayable) {
-                hostFirstPaintComplete.value = false
-                hostFirstFullSizePaintComplete.value = false
+                attached.value = false
             }
         }
         host.onFirstPaint = {
-            hostFirstPaintComplete.value = true
-        }
-        host.onFirstFullSizePaint = {
-            hostFirstFullSizePaintComplete.value = true
             DesktopPlayerLaunchShield.hideAfter()
+            if (!attached.value) {
+                attached.value = true
+                System.err.println("[NUVIO_SURFACE] onFirstPaint, calling attach()")
+            }
         }
         onDispose {
             host.onDisplayableChanged = null
             host.onFirstPaint = null
-            host.onFirstFullSizePaint = null
             host.dispose()
             DesktopPlayerLaunchShield.hide()
         }
@@ -368,25 +343,25 @@ private fun NativePlayerSurface(
         onDispose { controller.dispose() }
     }
 
-    LaunchedEffect(controller, sourceUrl, playbackHeaders, decoderPriority, nvidiaRtxSuperResolutionEnabled, hostFirstFullSizePaintComplete.value) {
-        if (!hostFirstFullSizePaintComplete.value) {
-            return@LaunchedEffect
-        }
+    LaunchedEffect(controller, sourceUrl, playbackHeaders, attached.value) {
+        if (!attached.value) return@LaunchedEffect
         delay(16L)
+        System.err.println("[NUVIO_SURFACE] attached=true, calling attach()")
         controller.attach(
             sourceUrl = sourceUrl,
             sourceHeaders = playbackHeaders,
             playWhenReady = playWhenReady,
             initialPositionMs = initialPositionMs,
-            decoderPriority = decoderPriority,
-            nvidiaRtxSuperResolutionEnabled = nvidiaRtxSuperResolutionEnabled,
             onError = { message -> latestOnError.value(message) },
         )
-        onControllerReady(controller)
     }
 
     LaunchedEffect(controller, playWhenReady) {
-        if (playWhenReady) controller.play() else controller.pause()
+        if (playWhenReady) {
+            controller.play()
+        } else {
+            controller.pause()
+        }
     }
 
     LaunchedEffect(controller, resizeMode) {
@@ -395,12 +370,6 @@ private fun NativePlayerSurface(
 
     LaunchedEffect(controller, playerControlsState) {
         controller.updateControls(playerControlsState)
-    }
-
-    LaunchedEffect(controller) {
-        desktopFullscreenChanges.drop(1).collect {
-            controller.onDesktopFullscreenChanged()
-        }
     }
 
     LaunchedEffect(controller) {
@@ -417,13 +386,7 @@ private fun NativePlayerSurface(
     ) {
         SwingPanel(
             factory = { host },
-            modifier = if (hostFirstPaintComplete.value) {
-                Modifier.fillMaxSize()
-            } else {
-                Modifier
-                    .align(Alignment.BottomEnd)
-                    .requiredSize(1.dp)
-            },
+            modifier = Modifier.fillMaxSize(),
             background = Color.Black,
         )
     }

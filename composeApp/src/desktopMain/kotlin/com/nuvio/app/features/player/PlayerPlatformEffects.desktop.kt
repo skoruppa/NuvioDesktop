@@ -7,6 +7,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.unit.IntSize
 import com.nuvio.app.core.ui.DesktopBackHandlers
 import com.nuvio.app.features.player.desktop.DesktopHostOs
+import java.awt.KeyboardFocusManager
+import java.awt.Window
 
 @Composable
 actual fun LockPlayerToLandscape() = Unit
@@ -64,6 +66,7 @@ private class DesktopKeepAwakeController : AutoCloseable {
         inhibitProcess = when (DesktopHostOs.current) {
             DesktopHostOs.MACOS -> startMacOsInhibit()
             DesktopHostOs.LINUX -> startLinuxInhibit()
+            DesktopHostOs.WINDOWS -> startWindowsInhibit()
             else -> null
         }
     }
@@ -82,9 +85,8 @@ private class DesktopKeepAwakeController : AutoCloseable {
     }
 
     private fun startLinuxInhibit(): Process? {
-        // Tier 1: systemd-inhibit (systemd / elogind / Devuan)
-        runCatching {
-            val process = ProcessBuilder(
+        val systemdProcess = runCatching {
+            ProcessBuilder(
                 "systemd-inhibit",
                 "--what=handle-lid-switch:sleep:idle",
                 "--who=Nuvio",
@@ -92,38 +94,58 @@ private class DesktopKeepAwakeController : AutoCloseable {
                 "sleep",
                 "infinity",
             ).start()
-            if (process.isAlive) return process
-        }
+        }.getOrNull()
+        if (systemdProcess != null) return systemdProcess
 
-        // Tier 2: D-Bus direct call to logind (any distro with logind running)
-        runCatching {
-            val process = ProcessBuilder(
-                "dbus-send",
-                "--session",
-                "--type=method_call",
-                "--dest=org.freedesktop.login1",
-                "/org/freedesktop/login1",
-                "org.freedesktop.login1.Manager.Inhibit",
-                "string:sleep",
-                "string:Nuvio",
-                "string:Playing video",
-                "string:delay",
-            ).start()
-            process.waitFor()
-            if (process.exitValue() == 0) return process
-        }
+        if (DesktopHostOs.isWayland) return null
 
-        // Tier 3: xdg-screensaver (X11 fallback)
-        runCatching {
-            val process = ProcessBuilder(
+        val windowId = resolveX11WindowId() ?: return null
+        return runCatching {
+            ProcessBuilder(
                 "xdg-screensaver",
                 "suspend",
-                "0",
+                windowId.toString(),
             ).start()
-            if (process.isAlive) return process
-        }
+        }.getOrNull()
+    }
 
-        return null
+    private fun resolveX11WindowId(): Long? {
+        return runCatching {
+            val window = KeyboardFocusManager.getCurrentKeyboardFocusManager().activeWindow
+                ?: Window.getWindows().firstOrNull { it.isVisible && it.isActive }
+                ?: return null
+            val peerField = java.awt.Component::class.java.getDeclaredField("peer")
+            peerField.isAccessible = true
+            val peer = peerField.get(window) ?: return null
+            val method = peer.javaClass.getDeclaredMethod("getAWTView")
+            method.isAccessible = true
+            val id = (method.invoke(peer) as Number).toLong()
+            if (id > 0) id else null
+        }.getOrNull()
+    }
+
+    private fun startWindowsInhibit(): Process? {
+        return runCatching {
+            val script = """
+                Add-Type -TypeDefinition '
+                    using System;
+                    using System.Runtime.InteropServices;
+                    public class SleepInhibitor {
+                        [DllImport("kernel32.dll", SetLastError = true)]
+                        public static extern uint SetThreadExecutionState(uint esFlags);
+                        public static void PreventSleep() {
+                            SetThreadExecutionState(0x80000002);
+                        }
+                        public static void AllowSleep() {
+                            SetThreadExecutionState(0x80000000);
+                        }
+                    }
+                ';
+                [SleepInhibitor]::PreventSleep();
+                try { Sleep -Timeout 2147483; } finally { [SleepInhibitor]::AllowSleep(); }
+            """.trimIndent()
+            ProcessBuilder("powershell", "-NoProfile", "-Command", script).start()
+        }.getOrNull()
     }
 
     private fun stopInhibit() {

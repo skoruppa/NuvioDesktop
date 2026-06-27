@@ -22,7 +22,7 @@ if command -v rpmrebuild &>/dev/null; then
 
   # Build requires filter to append our runtime deps
   rpmrebuild \
-    --change-spec-requires="s/^Requires:.*/&, libmpv, alsa-lib, pulseaudio-libs, vulkan-loader, libX11, mesa-libGL, zlib/" \
+    --change-spec-requires="s/^Requires:.*/&, libmpv, alsa-lib, pulseaudio-libs, vulkan-loader, libX11, mesa-libGL, zlib, wayland-client, wayland-cursor, wayland-egl, libdecor/" \
     --directory="$WORK_DIR" \
     --verbose \
     "$RPM_PATH" 2>&1
@@ -50,7 +50,7 @@ else
 
   # Retry with rpmrebuild
   rpmrebuild \
-    --change-spec-requires="s/^Requires:.*/&, libmpv, alsa-lib, pulseaudio-libs, vulkan-loader, libX11, mesa-libGL, zlib/" \
+    --change-spec-requires="s/^Requires:.*/&, libmpv, alsa-lib, pulseaudio-libs, vulkan-loader, libX11, mesa-libGL, zlib, wayland-client, wayland-cursor, wayland-egl, libdecor/" \
     --directory="$WORK_DIR" \
     --verbose \
     "$RPM_PATH" 2>&1

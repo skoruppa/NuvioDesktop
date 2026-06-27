@@ -505,10 +505,12 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             onSubtitleClick = {
                 refreshTracks()
                 showSubtitleModal = true
+                controlsVisible = true
             },
             onAudioClick = {
                 refreshTracks()
                 showAudioModal = true
+                controlsVisible = true
             },
             onVolumeClick = { showVolumeModal = true },
             onVideoSettingsClick = if (isIos || isDesktop) {
