@@ -12,4 +12,5 @@ internal actual val isIos: Boolean = true
 internal actual val isDesktop: Boolean = false
 internal actual val isWindows: Boolean = false
 internal actual val isLinux: Boolean = false
+internal actual val hasNativeControlsOverlay: Boolean = false
 

@@ -10,4 +10,5 @@ internal expect val isIos: Boolean
 internal expect val isDesktop: Boolean
 internal expect val isWindows: Boolean
 internal expect val isLinux: Boolean
+internal expect val hasNativeControlsOverlay: Boolean
 
