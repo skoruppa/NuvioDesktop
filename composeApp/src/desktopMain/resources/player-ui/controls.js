@@ -395,7 +395,13 @@ const send = (type, value = 0) => {
     return;
   }
   const webViewBridge = window.chrome && window.chrome.webview;
-  if (webViewBridge) webViewBridge.postMessage({ type, value });
+  if (webViewBridge) {
+    webViewBridge.postMessage({ type, value });
+    return;
+  }
+  if (window.javaBridge) {
+    window.javaBridge.postMessage(JSON.stringify({ type, value }));
+  }
 };
 
 const syncFullscreenButtons = () => {

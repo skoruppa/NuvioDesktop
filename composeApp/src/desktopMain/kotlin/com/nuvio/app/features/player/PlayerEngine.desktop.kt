@@ -1,44 +1,29 @@
 package com.nuvio.app.features.player
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.awt.SwingPanel
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asSkiaBitmap
-import androidx.compose.ui.graphics.toComposeImageBitmap
-import androidx.compose.ui.ExperimentalComposeUiApi
-import androidx.compose.ui.input.pointer.PointerButton
-import androidx.compose.ui.input.pointer.PointerEventType
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.unit.IntSize
 import com.nuvio.app.features.player.desktop.AwtNativePlayerHost
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
+import com.nuvio.app.features.player.desktop.JavaFxPlayerHost
+import com.nuvio.app.features.player.desktop.JavaFxPlayerSurface
+import com.nuvio.app.features.player.desktop.LinuxPlayerHost
+import com.nuvio.app.features.player.desktop.NativePlayerBridge
 import com.nuvio.app.features.player.desktop.NativePlayerController
-import com.nuvio.app.features.player.desktop.LinuxPlayerSurface
-import com.nuvio.app.features.player.desktop.NativePlayerHost
-import com.nuvio.app.features.player.desktop.toggleDesktopAppFullscreen
-import java.awt.AWTEvent
-import java.awt.Toolkit
-import java.awt.event.AWTEventListener
-import java.awt.event.MouseEvent
+import com.nuvio.app.features.player.desktop.updateJavaFxControls
 import kotlinx.coroutines.delay
 
 @Composable
@@ -64,57 +49,82 @@ actual fun PlatformPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    if (DesktopHostOs.current == DesktopHostOs.LINUX) {
-        LinuxPlayerSurface(
-            sourceUrl = sourceUrl,
-            sourceHeaders = sourceHeaders,
-            modifier = modifier,
-            playWhenReady = playWhenReady,
-            resizeMode = resizeMode,
-            initialPositionMs = initialPositionMs,
-            playerControlsState = playerControlsState,
-            onPlayerControlsAction = onPlayerControlsAction,
-            onPlayerControlsEvent = onPlayerControlsEvent,
-            onPlayerControlsScrubChange = onPlayerControlsScrubChange,
-            onPlayerControlsScrubFinished = onPlayerControlsScrubFinished,
-            onControllerReady = onControllerReady,
-            onSnapshot = onSnapshot,
-            onError = onError,
-        )
-    } else if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS) {
-        LegacyAwtNativePlayerSurface(
-            sourceUrl = sourceUrl,
-            sourceHeaders = sourceHeaders,
-            modifier = modifier,
-            playWhenReady = playWhenReady,
-            resizeMode = resizeMode,
-            initialPositionMs = initialPositionMs,
-            playerControlsState = playerControlsState,
-            onPlayerControlsAction = onPlayerControlsAction,
-            onPlayerControlsEvent = onPlayerControlsEvent,
-            onPlayerControlsScrubChange = onPlayerControlsScrubChange,
-            onPlayerControlsScrubFinished = onPlayerControlsScrubFinished,
-            onControllerReady = onControllerReady,
-            onSnapshot = onSnapshot,
-            onError = onError,
-        )
-    } else {
-        DesktopStubPlayerSurface(
-            modifier = modifier,
-            onControllerReady = onControllerReady,
-            onSnapshot = onSnapshot,
-        )
+    when (DesktopHostOs.current) {
+        DesktopHostOs.LINUX -> {
+            if (!DesktopHostOs.isWayland) {
+                // Linux X11: AWT Canvas + SwingPanel — mpv يعرض عبر X11 WID داخل SwingPanel
+                // WebKitGTK فوقه كـ overlay (GtkPlug) — نفس نموذج macOS/Windows
+                LegacyAwtNativePlayerSurface(
+                    sourceUrl = sourceUrl,
+                    sourceHeaders = sourceHeaders,
+                    modifier = modifier,
+                    playWhenReady = playWhenReady,
+                    resizeMode = resizeMode,
+                    initialPositionMs = initialPositionMs,
+                    playerControlsState = playerControlsState,
+                    onPlayerControlsAction = onPlayerControlsAction,
+                    onPlayerControlsEvent = onPlayerControlsEvent,
+                    onPlayerControlsScrubChange = onPlayerControlsScrubChange,
+                    onPlayerControlsScrubFinished = onPlayerControlsScrubFinished,
+                    onControllerReady = onControllerReady,
+                    onSnapshot = onSnapshot,
+                    onError = onError,
+                )
+            } else {
+                // Linux Wayland: AWT offscreen mpv + JavaFX WebView controls overlay
+                WaylandJavaFxPlayerSurface(
+                    sourceUrl = sourceUrl,
+                    sourceHeaders = sourceHeaders,
+                    modifier = modifier,
+                    playWhenReady = playWhenReady,
+                    resizeMode = resizeMode,
+                    initialPositionMs = initialPositionMs,
+                    playerControlsState = playerControlsState,
+                    onPlayerControlsAction = onPlayerControlsAction,
+                    onPlayerControlsEvent = onPlayerControlsEvent,
+                    onPlayerControlsScrubChange = onPlayerControlsScrubChange,
+                    onPlayerControlsScrubFinished = onPlayerControlsScrubFinished,
+                    onControllerReady = onControllerReady,
+                    onSnapshot = onSnapshot,
+                    onError = onError,
+                )
+            }
+        }
+        DesktopHostOs.MACOS, DesktopHostOs.WINDOWS -> {
+            // macOS / Windows: AWT Canvas + SwingPanel
+            LegacyAwtNativePlayerSurface(
+                sourceUrl = sourceUrl,
+                sourceHeaders = sourceHeaders,
+                modifier = modifier,
+                playWhenReady = playWhenReady,
+                resizeMode = resizeMode,
+                initialPositionMs = initialPositionMs,
+                playerControlsState = playerControlsState,
+                onPlayerControlsAction = onPlayerControlsAction,
+                onPlayerControlsEvent = onPlayerControlsEvent,
+                onPlayerControlsScrubChange = onPlayerControlsScrubChange,
+                onPlayerControlsScrubFinished = onPlayerControlsScrubFinished,
+                onControllerReady = onControllerReady,
+                onSnapshot = onSnapshot,
+                onError = onError,
+            )
+        }
+        else -> {
+            DesktopStubPlayerSurface(
+                modifier = modifier,
+                onControllerReady = onControllerReady,
+                onSnapshot = onSnapshot,
+            )
+        }
     }
 }
 
-/**
- * Linux path: renders video frames in a Compose [Canvas] so controls overlay correctly
- * without the heavyweight AWT X11 child window problem.
- * On Wayland, uses optimized SW rendering with gpu-context=wayland for better performance.
- */
-@OptIn(ExperimentalComposeUiApi::class)
+// ─────────────────────────────────────────────────────────────────────────────
+// Linux: GTK standalone — نافذة واحدة = فيديو + controls
+// Compose يعرض صندوق أسود placeholder فقط
+// ─────────────────────────────────────────────────────────────────────────────
 @Composable
-private fun LinuxComposeSurface(
+private fun LinuxGtkPlayerSurface(
     sourceUrl: String,
     sourceHeaders: Map<String, String>,
     modifier: Modifier,
@@ -130,12 +140,11 @@ private fun LinuxComposeSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    val host = remember { NativePlayerHost() }
+    val host = remember { LinuxPlayerHost() }
     val controller = remember(host) { NativePlayerController(host) }
-    var surfaceSize by remember { mutableStateOf(IntSize.Zero) }
-    var frameTick by remember { mutableIntStateOf(0) }
-
     val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
+
+    val latestOnPlayerControlsAction = rememberUpdatedState(onPlayerControlsAction)
     val latestOnPlayerControlsEvent = rememberUpdatedState(onPlayerControlsEvent)
     val latestOnPlayerControlsScrubChange = rememberUpdatedState(onPlayerControlsScrubChange)
     val latestOnPlayerControlsScrubFinished = rememberUpdatedState(onPlayerControlsScrubFinished)
@@ -145,10 +154,17 @@ private fun LinuxComposeSurface(
         onControllerReady(controller)
     }
 
-    LaunchedEffect(controller, sourceUrl, playbackHeaders) {
-        DesktopPlayerLaunchShield.hideAfter()
-        delay(16L)
-        System.err.println("[NUVIO_SURFACE] calling attach()")
+    LaunchedEffect(controller) {
+        controller.setControlCallbacks(
+            onAction = { action -> latestOnPlayerControlsAction.value(action) },
+            onEvent = { type, value -> latestOnPlayerControlsEvent.value(type, value) },
+            onScrubChange = { positionMs -> latestOnPlayerControlsScrubChange.value(positionMs) },
+            onScrubFinished = { positionMs -> latestOnPlayerControlsScrubFinished.value(positionMs) },
+        )
+    }
+
+    // على Linux لا ننتظر AWT peer — نشغّل مباشرة عبر GTK
+    DisposableEffect(controller, sourceUrl, playbackHeaders) {
         controller.attach(
             sourceUrl = sourceUrl,
             sourceHeaders = playbackHeaders,
@@ -156,14 +172,11 @@ private fun LinuxComposeSurface(
             initialPositionMs = initialPositionMs,
             onError = { message -> latestOnError.value(message) },
         )
+        onDispose { controller.dispose() }
     }
 
     LaunchedEffect(controller, playWhenReady) {
-        if (playWhenReady) {
-            controller.play()
-        } else {
-            controller.pause()
-        }
+        if (playWhenReady) controller.play() else controller.pause()
     }
 
     LaunchedEffect(controller, resizeMode) {
@@ -175,104 +188,131 @@ private fun LinuxComposeSurface(
     }
 
     LaunchedEffect(controller) {
-        try {
-            while (true) {
-                onSnapshot(controller.snapshot())
-                delay(500L)
-            }
-        } finally {
-            /* coroutine cancelled on dispose */
+        while (true) {
+            onSnapshot(controller.snapshot())
+            delay(500L)
         }
     }
 
-    var lastRenderSize = IntSize.Zero
+    // صندوق أسود — الفيديو في GTK window المستقلة
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Linux Wayland: AWT offscreen mpv + JavaFX WebView controls overlay
+// واجهة واحدة فقط: controls.html عبر JavaFX WebView
+// ─────────────────────────────────────────────────────────────────────────────
+@Composable
+private fun WaylandJavaFxPlayerSurface(
+    sourceUrl: String,
+    sourceHeaders: Map<String, String>,
+    modifier: Modifier,
+    playWhenReady: Boolean,
+    resizeMode: PlayerResizeMode,
+    initialPositionMs: Long,
+    playerControlsState: PlayerControlsState,
+    onPlayerControlsAction: (PlayerControlsAction) -> Boolean,
+    onPlayerControlsEvent: (String, Double) -> Boolean,
+    onPlayerControlsScrubChange: (Long) -> Boolean,
+    onPlayerControlsScrubFinished: (Long) -> Boolean,
+    onControllerReady: (PlayerEngineController) -> Unit,
+    onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
+    onError: (String?) -> Unit,
+) {
+    val host = remember { JavaFxPlayerHost() }
+    val controller = remember(host) { NativePlayerController(host) }
+
+    LaunchedEffect(sourceUrl) {
+        DesktopPlayerLaunchShield.showForActiveWindow()
+    }
+
+    val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
+    val latestOnPlayerControlsAction = rememberUpdatedState(onPlayerControlsAction)
+    val latestOnPlayerControlsEvent = rememberUpdatedState(onPlayerControlsEvent)
+    val latestOnPlayerControlsScrubChange = rememberUpdatedState(onPlayerControlsScrubChange)
+    val latestOnPlayerControlsScrubFinished = rememberUpdatedState(onPlayerControlsScrubFinished)
+    val latestOnError = rememberUpdatedState(onError)
 
     LaunchedEffect(controller) {
-        try {
-            while (true) {
-                delay(16)
-                val size = surfaceSize
-                if (host.nativeHandle != 0L && size.width > 0 && size.height > 0) {
-                    val rendered = host.renderFrame(
-                        width = size.width,
-                        height = size.height,
-                    )
-                    if (rendered) {
-                        frameTick++
-                    }
-                    lastRenderSize = size
-                }
-            }
-        } finally {
-            /* coroutine cancelled on dispose */
+        onControllerReady(controller)
+    }
+
+    LaunchedEffect(controller) {
+        controller.setControlCallbacks(
+            onAction = { action -> latestOnPlayerControlsAction.value(action) },
+            onEvent = { type, value -> latestOnPlayerControlsEvent.value(type, value) },
+            onScrubChange = { positionMs -> latestOnPlayerControlsScrubChange.value(positionMs) },
+            onScrubFinished = { positionMs -> latestOnPlayerControlsScrubFinished.value(positionMs) },
+        )
+    }
+
+    LaunchedEffect(controller) {
+        controller.setControlsUpdateCallback { json ->
+            updateJavaFxControls(json)
         }
     }
 
     DisposableEffect(controller, sourceUrl, playbackHeaders) {
-        onDispose { controller.dispose() }
-    }
-
-    DisposableEffect(host) {
-        onDispose { host.dispose() }
-    }
-
-    DisposableEffect(Unit) {
-        val listener = AWTEventListener { awtEvent ->
-            when (awtEvent.id) {
-                MouseEvent.MOUSE_MOVED, MouseEvent.MOUSE_DRAGGED -> {
-                    host.noteCursorActivity()
-                    latestOnPlayerControlsEvent.value("keepChromeVisible", 0.0)
-                }
-            }
-        }
-        Toolkit.getDefaultToolkit().addAWTEventListener(
-            listener,
-            AWTEvent.MOUSE_EVENT_MASK or AWTEvent.MOUSE_MOTION_EVENT_MASK,
-        )
         onDispose {
-            Toolkit.getDefaultToolkit().removeAWTEventListener(listener)
+            controller.dispose()
+            DesktopPlayerLaunchShield.hide()
         }
     }
+
+    LaunchedEffect(controller, sourceUrl, playbackHeaders) {
+        controller.attach(
+            sourceUrl = sourceUrl,
+            sourceHeaders = playbackHeaders,
+            playWhenReady = playWhenReady,
+            initialPositionMs = initialPositionMs,
+            onError = { message -> latestOnError.value(message) },
+        )
+    }
+
+    LaunchedEffect(controller, playWhenReady) {
+        if (playWhenReady) controller.play() else controller.pause()
+    }
+
+    LaunchedEffect(controller, resizeMode) {
+        controller.setResizeMode(resizeMode)
+    }
+
+    LaunchedEffect(controller, playerControlsState) {
+        controller.updateControls(playerControlsState)
+    }
+
+    LaunchedEffect(controller) {
+        while (true) {
+            onSnapshot(controller.snapshot())
+            delay(500L)
+        }
+    }
+
+    val controlsUrl = remember { NativePlayerBridge.controlsPageUrl }
 
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color.Black)
-            .pointerInput(Unit) {
-                awaitPointerEventScope {
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        if (event.type == PointerEventType.Scroll) {
-                            event.changes.firstOrNull()?.scrollDelta?.y?.let { delta ->
-                                controller.seekBy(if (delta < 0f) 10000L else -10000L)
-                            }
-                        }
-                    }
-                }
-            },
+            .background(Color.Black),
     ) {
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .onSizeChanged { surfaceSize = it },
-        ) {
-            frameTick
-            host.latestImage?.toComposeImageBitmap()?.let { imageBitmap ->
-                drawImage(
-                    image = imageBitmap,
-                    dstOffset = IntOffset.Zero,
-                    dstSize = IntSize(size.width.toInt(), size.height.toInt()),
-                )
-                imageBitmap.asSkiaBitmap().close()
-            }
-        }
+        JavaFxPlayerSurface(
+            controlsPageUrl = controlsUrl,
+            host = host,
+            onPlayerEvent = { type, value ->
+                latestOnPlayerControlsEvent.value(type, value)
+            },
+            modifier = Modifier.fillMaxSize(),
+        )
     }
 }
 
-/**
- * macOS / Windows path: uses AWT Canvas + SwingPanel (existing working approach).
- * These platforms need the native view pointer for hardware-accelerated rendering.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// macOS / Windows: AWT Canvas + SwingPanel (المسار الأصلي)
+// ─────────────────────────────────────────────────────────────────────────────
 @Composable
 private fun LegacyAwtNativePlayerSurface(
     sourceUrl: String,
@@ -311,9 +351,7 @@ private fun LegacyAwtNativePlayerSurface(
 
     DisposableEffect(host) {
         host.onDisplayableChanged = { displayable ->
-            if (!displayable) {
-                attached.value = false
-            }
+            if (!displayable) attached.value = false
         }
         host.onFirstPaint = {
             DesktopPlayerLaunchShield.hideAfter()
@@ -357,11 +395,7 @@ private fun LegacyAwtNativePlayerSurface(
     }
 
     LaunchedEffect(controller, playWhenReady) {
-        if (playWhenReady) {
-            controller.play()
-        } else {
-            controller.pause()
-        }
+        if (playWhenReady) controller.play() else controller.pause()
     }
 
     LaunchedEffect(controller, resizeMode) {
@@ -392,6 +426,9 @@ private fun LegacyAwtNativePlayerSurface(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Stub للأنظمة غير المدعومة
+// ─────────────────────────────────────────────────────────────────────────────
 @Composable
 private fun DesktopStubPlayerSurface(
     modifier: Modifier,

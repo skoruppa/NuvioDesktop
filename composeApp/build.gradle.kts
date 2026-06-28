@@ -1078,6 +1078,18 @@ kotlin {
                 implementation(libs.ktor.client.cio)
                 implementation(libs.quickjs.kt)
                 implementation(libs.ksoup)
+                implementation("org.openjfx:javafx-web:21.0.2")
+                implementation("org.openjfx:javafx-media:21.0.2")
+                implementation("org.openjfx:javafx-controls:21.0.2")
+                implementation("org.openjfx:javafx-graphics:21.0.2")
+                implementation("org.openjfx:javafx-swing:21.0.2")
+                implementation("org.openjfx:javafx-base:21.0.2")
+                implementation("org.openjfx:javafx-web:21.0.2:linux")
+                implementation("org.openjfx:javafx-media:21.0.2:linux")
+                implementation("org.openjfx:javafx-controls:21.0.2:linux")
+                implementation("org.openjfx:javafx-graphics:21.0.2:linux")
+                implementation("org.openjfx:javafx-swing:21.0.2:linux")
+                implementation("org.openjfx:javafx-base:21.0.2:linux")
             }
         }
         commonMain.dependencies {
@@ -1128,6 +1140,7 @@ compose.desktop {
             "--add-opens=java.desktop/sun.lwawt.macosx=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.awt.windows=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED",
+            "--add-opens=java.base/java.lang=ALL-UNNAMED",
             smokePlayerUrl?.takeIf { it.isNotBlank() }?.let { "-Dnuvio.desktop.smokePlayerUrl=$it" },
             // ── Memory management ──
             "-Xms256m",
@@ -1152,6 +1165,10 @@ compose.desktop {
                 "java.management",
                 "java.net.http",
                 "jdk.unsupported",
+                "javafx.web",
+                "javafx.media",
+                "javafx.controls",
+                "javafx.graphics",
             )
             macOS {
                 bundleID = "com.nuvio.media.desktop"
@@ -1464,36 +1481,45 @@ if (isLinuxHost) {
 
 val linuxPlayerBridgeJavaHome = providers.systemProperty("java.home").get()
 
+/* Resolve pkg-config flags at configuration time (required for configuration cache) */
+val linuxBridgeCflags = if (isLinuxHost) {
+    listOf("mpv", "gtk+-3.0", "webkit2gtk-4.1").flatMap { pkg ->
+        listOf("pkg-config", "--cflags", pkg).runCommand()?.trim().orEmpty()
+            .split(" ").filter { it.isNotBlank() }
+    }
+} else emptyList()
+
+val linuxBridgeLibs = if (isLinuxHost) {
+    listOf("mpv", "gtk+-3.0", "webkit2gtk-4.1", "gdk-3.0", "javascriptcoregtk-4.1").flatMap { pkg ->
+        listOf("pkg-config", "--libs", pkg).runCommand()?.trim().orEmpty()
+            .split(" ").filter { it.isNotBlank() }
+    }
+} else emptyList()
+
 val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
     enabled = isLinuxHost
     inputs.file(linuxPlayerBridgeSource)
     outputs.file(linuxPlayerBridgeOutput)
-    doFirst {
-        val javaHome = linuxPlayerBridgeJavaHome
-        val javaIncludes = "-I${javaHome}/include -I${javaHome}/include/linux"
-        val mpvPkg = "mpv"
-        val cflags = try {
-            listOf("pkg-config", "--cflags", mpvPkg).runCommand()?.trim() ?: ""
-        } catch (_: Exception) { "" }
-        val libs = try {
-            listOf("pkg-config", "--libs", mpvPkg).runCommand()?.trim() ?: ""
-        } catch (_: Exception) { "" }
-        val sourceFile = linuxPlayerBridgeSource.asFile
-        val outputFile = linuxPlayerBridgeOutput.get().asFile
-        commandLine(
+
+    val javaIncludes = "-I${linuxPlayerBridgeJavaHome}/include -I${linuxPlayerBridgeJavaHome}/include/linux"
+    val sourceFile = linuxPlayerBridgeSource.asFile
+    val outputFile = linuxPlayerBridgeOutput.get().asFile
+    commandLine(
+        listOf(
             "gcc", "-shared", "-fPIC",
-            "-Wl,-rpath,'\$ORIGIN'",
+            "-Wl,-rpath,\$ORIGIN",
             "-o", outputFile.absolutePath,
             sourceFile.absolutePath,
             *javaIncludes.split(" ").filter { it.isNotBlank() }.toTypedArray(),
-            *cflags.split(" ").filter { it.isNotBlank() }.toTypedArray(),
-            *libs.split(" ").filter { it.isNotBlank() }.toTypedArray(),
-            "-lEGL", "-lGL", "-lgbm",
+            *linuxBridgeCflags.toTypedArray(),
+            *linuxBridgeLibs.toTypedArray(),
             "-lX11",
             "-ldl",
             "-lm",
+            "-lEGL",
+            "-lGL",
         )
-    }
+    )
 }
 
 val prepareLinuxPlayerRuntime = tasks.register<Sync>("prepareLinuxPlayerRuntime") {

@@ -10,4 +10,5 @@ internal actual val isIos: Boolean = false
 internal actual val isDesktop: Boolean = true
 internal actual val isWindows: Boolean = System.getProperty("os.name").orEmpty().lowercase().contains("win")
 internal actual val isLinux: Boolean = System.getProperty("os.name").orEmpty().lowercase().contains("linux")
+internal actual val hasNativeControlsOverlay: Boolean = true
 

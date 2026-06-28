@@ -27,7 +27,6 @@ import com.nuvio.app.features.player.toStorageHexString
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
-import java.awt.Component
 import javax.swing.SwingUtilities
 import kotlin.concurrent.Volatile
 
@@ -48,22 +47,16 @@ internal class NativePlayerController(
     private var onEvent: (String, Double) -> Boolean = { _, _ -> false }
     private var onScrubChange: (Long) -> Boolean = { false }
     private var onScrubFinished: (Long) -> Boolean = { false }
+    private var onControlsUpdate: ((String) -> Unit)? = null
     private val eventSink = NativePlayerEventSink { type, value ->
-        if (DesktopHostOs.current == DesktopHostOs.LINUX) {
+        SwingUtilities.invokeLater {
             handlePlayerEvent(type, value)
-        } else {
-            SwingUtilities.invokeLater {
-                handlePlayerEvent(type, value)
-            }
         }
     }
 
     init {
         host.onMouseClick = {
-            val handled = onAction(PlayerControlsAction.ToggleChrome)
-            if (!handled) {
-                /* fallback: native chrome toggle not available, ignore */
-            }
+            onAction(PlayerControlsAction.ToggleChrome)
         }
     }
 
@@ -87,14 +80,22 @@ internal class NativePlayerController(
         )
         pendingSource = pending
 
-        if (host is AwtNativePlayerHost) {
-            val awtHost = host as AwtNativePlayerHost
-            awtHost.onPeerReady = { attachPending() }
-            if (awtHost.isDisplayable) {
-                attachPending()
+        when {
+            // Linux Wayland: standalone GTK window — لا AWT peer
+            DesktopHostOs.current == DesktopHostOs.LINUX && DesktopHostOs.isWayland -> {
+                attachPendingDirect(pending)
             }
-        } else {
-            attachPending()
+            // Linux X11 / macOS / Windows: AWT Canvas مع native embedding
+            host is AwtNativePlayerHost -> {
+                val awtHost = host as AwtNativePlayerHost
+                awtHost.onPeerReady = { attachPending() }
+                if (awtHost.isDisplayable) {
+                    attachPending()
+                }
+            }
+            else -> {
+                attachPendingDirect(pending)
+            }
         }
     }
 
@@ -153,14 +154,14 @@ internal class NativePlayerController(
             updateControls(controlsState)
             configureIosVideoOutput(PlayerSettingsRepository.uiState.value)
         }.onFailure { error ->
-            System.err.println("[NUVIO_ATTACH] FAILED: ${error.message}")
-            pending.onError(error.message)
+            System.err.println("[NUVIO_ATTACH] AWT path failed (${error.message}), falling back to standalone mode")
+            attachPendingDirect(pending)
         }
     }
 
     private fun attachPendingDirect(pending: PendingSource) {
         disposePlayerHandle()
-        System.err.println("[NUVIO_ATTACH] non-AWT host, calling create()")
+        System.err.println("[NUVIO_ATTACH] direct attach (hostViewPtr=0L), calling create()")
         runCatching {
             handle = NativePlayerBridge.create(
                 hostViewPtr = 0L,
@@ -170,7 +171,7 @@ internal class NativePlayerController(
                 headerLines = pending.headerLines.toTypedArray(),
                 playWhenReady = pending.playWhenReady,
                 initialPositionMs = pending.initialPositionMs,
-                controlsPageUrl = "",
+                controlsPageUrl = NativePlayerBridge.controlsPageUrl,
                 decoderPriority = pending.decoderPriority,
                 nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
                 eventSink = eventSink,
@@ -201,6 +202,10 @@ internal class NativePlayerController(
         }
     }
 
+    fun setControlsUpdateCallback(callback: (String) -> Unit) {
+        onControlsUpdate = callback
+    }
+
     fun updateControls(state: PlayerControlsState) {
         host.setControlsVisible(state.controlsVisible)
         val currentHandle = handle
@@ -214,14 +219,25 @@ internal class NativePlayerController(
             state
         }
         controlsState = stateWithVolume
-        val isFullscreen = (host as? java.awt.Component)?.let { isDesktopAppFullscreen(SwingUtilities.getWindowAncestor(it)) } ?: false
+
+        val isFullscreen = (host as? java.awt.Component)
+            ?.let { isDesktopAppFullscreen(SwingUtilities.getWindowAncestor(it)) }
+            ?: false
+
         val structureKey = NativeControlsStructureKey(
             state = stateWithVolume.nativeControlsStructureKey(),
             isFullscreen = isFullscreen,
         )
         if (structureKey == lastSentControlsStructureKey) return
         lastSentControlsStructureKey = structureKey
-        NativePlayerBridge.updateControls(current, stateWithVolume.toControlsJson(isFullscreen))
+
+        val json = stateWithVolume.toControlsJson(isFullscreen)
+        val callback = onControlsUpdate
+        if (callback != null) {
+            callback(json)
+        } else {
+            NativePlayerBridge.updateControls(current, json)
+        }
     }
 
     fun setResizeMode(mode: PlayerResizeMode) {
@@ -242,29 +258,20 @@ internal class NativePlayerController(
         when (type) {
             "cursorActivity" -> host.noteCursorActivity()
             "scrubChange" -> {
-                if (!onScrubChange(value.toLong())) {
-                    updateLocalProgress(value.toLong())
-                }
+                if (!onScrubChange(value.toLong())) updateLocalProgress(value.toLong())
             }
             "scrubFinish" -> {
-                val scrubHandled = onScrubFinished(value.toLong())
-                if (!scrubHandled) {
-                    seekTo(value.toLong())
-                }
+                val handled = onScrubFinished(value.toLong())
+                if (!handled) seekTo(value.toLong())
             }
-            "toggleFullscreen" -> {
-                toggleDesktopAppFullscreen()
-            }
+            "toggleFullscreen" -> toggleDesktopAppFullscreen()
             "volumeChange" -> setFallbackVolume(value.toFloat())
             else -> {
                 val eventHandled = onEvent(type, value)
                 if (eventHandled) return
-                val action = type.toPlayerControlsAction()
-                if (action == null) return
+                val action = type.toPlayerControlsAction() ?: return
                 val actionHandled = onAction(action)
-                if (!actionHandled) {
-                    handleFallbackAction(action)
-                }
+                if (!actionHandled) handleFallbackAction(action)
             }
         }
     }
@@ -278,8 +285,7 @@ internal class NativePlayerController(
         when (action) {
             PlayerControlsAction.TogglePlayback,
             PlayerControlsAction.KeyboardTogglePlayback -> {
-                val current = handle
-                if (current == 0L) return
+                val current = handle.takeIf { it != 0L } ?: return
                 val isEnded = NativePlayerBridge.isEnded(current)
                 val isPaused = NativePlayerBridge.isPaused(current)
                 if (isEnded) {
@@ -293,45 +299,31 @@ internal class NativePlayerController(
             PlayerControlsAction.KeyboardSeekBack -> fallbackSeekBy(-10_000L)
             PlayerControlsAction.SeekForward,
             PlayerControlsAction.KeyboardSeekForward -> fallbackSeekBy(10_000L)
-            PlayerControlsAction.KeyboardVolumeDown -> {
-                _volume = (_volume - 2.5f).coerceIn(0f, 100f)
-                adjustFallbackVolume(-5f)
-            }
-            PlayerControlsAction.KeyboardVolumeUp -> {
-                _volume = (_volume + 2.5f).coerceIn(0f, 100f)
-                adjustFallbackVolume(5f)
-            }
+            PlayerControlsAction.KeyboardVolumeDown -> adjustFallbackVolume(-5f)
+            PlayerControlsAction.KeyboardVolumeUp -> adjustFallbackVolume(5f)
             PlayerControlsAction.Speed -> cycleFallbackSpeed()
-            PlayerControlsAction.Fullscreen -> {
-                toggleDesktopAppFullscreen()
-            }
+            PlayerControlsAction.Fullscreen -> toggleDesktopAppFullscreen()
             else -> Unit
         }
     }
 
     private fun adjustFallbackVolume(delta: Float) {
-        val current = handle
-        if (current != 0L) {
-            val currentLevel = controlsState.volumeLevel ?: NativePlayerBridge.volume(current).coerceIn(0f, 1f)
-            val nextLevel = (currentLevel + (delta / 100f)).coerceIn(0f, 1f)
-            setFallbackVolume(nextLevel)
-        }
+        val current = handle.takeIf { it != 0L } ?: return
+        val currentLevel = controlsState.volumeLevel ?: NativePlayerBridge.volume(current).coerceIn(0f, 1f)
+        setFallbackVolume((currentLevel + (delta / 100f)).coerceIn(0f, 1f))
     }
 
     private fun setFallbackVolume(level: Float) {
-        val current = handle
-        if (current != 0L) {
-            val nextLevel = level.coerceIn(0f, 1f)
-            NativePlayerBridge.setVolume(current, nextLevel)
-            controlsState = controlsState.copy(volumeLevel = nextLevel)
-            updateControls(controlsState)
-        }
+        val current = handle.takeIf { it != 0L } ?: return
+        val nextLevel = level.coerceIn(0f, 1f)
+        NativePlayerBridge.setVolume(current, nextLevel)
+        controlsState = controlsState.copy(volumeLevel = nextLevel)
+        updateControls(controlsState)
     }
 
     override fun setVolume(volume: Float) {
         _volume = volume.coerceIn(0f, 100f)
-        val current = handle
-        if (current != 0L) {
+        handle.takeIf { it != 0L }?.let { current ->
             NativePlayerBridge.setProperty(current, "volume", (_volume * 2f).toInt().toString())
         }
     }
@@ -339,15 +331,11 @@ internal class NativePlayerController(
     override fun getVolume(): Float = _volume
 
     private fun fallbackSeekBy(offsetMs: Long) {
-        val current = handle
-        if (current != 0L) {
-            NativePlayerBridge.seekBy(current, offsetMs)
-        }
+        handle.takeIf { it != 0L }?.let { NativePlayerBridge.seekBy(it, offsetMs) }
     }
 
     private fun cycleFallbackSpeed() {
-        val current = handle
-        if (current == 0L) return
+        val current = handle.takeIf { it != 0L } ?: return
         val speeds = listOf(1f, 1.25f, 1.5f, 2f)
         val currentSpeed = NativePlayerBridge.speed(current)
         val next = speeds.firstOrNull { it > currentSpeed + 0.01f } ?: speeds.first()
@@ -355,8 +343,8 @@ internal class NativePlayerController(
     }
 
     fun snapshot(): PlayerPlaybackSnapshot {
-        val current = handle
-        if (current == 0L) return PlayerPlaybackSnapshot(isLoading = true)
+        val current = handle.takeIf { it != 0L }
+            ?: return PlayerPlaybackSnapshot(isLoading = true)
         return runCatching {
             val isLoading = NativePlayerBridge.isLoading(current)
             val isEnded = NativePlayerBridge.isEnded(current)
@@ -382,9 +370,7 @@ internal class NativePlayerController(
         handle = 0L
         host.nativeHandle = 0L
         lastSentControlsStructureKey = null
-        if (current != 0L) {
-            runCatching { NativePlayerBridge.dispose(current) }
-        }
+        if (current != 0L) runCatching { NativePlayerBridge.dispose(current) }
     }
 
     override fun play() {
@@ -511,11 +497,7 @@ internal class NativePlayerController(
             NativePlayerBridge.setProperty(current, "contrast", settings.iosContrast.toString())
             NativePlayerBridge.setProperty(current, "saturation", settings.iosSaturation.toString())
             NativePlayerBridge.setProperty(current, "gamma", settings.iosGamma.toString())
-            if (settings.iosDebandEnabled) {
-                NativePlayerBridge.setProperty(current, "deband", "yes")
-            } else {
-                NativePlayerBridge.setProperty(current, "deband", "no")
-            }
+            NativePlayerBridge.setProperty(current, "deband", if (settings.iosDebandEnabled) "yes" else "no")
             if (settings.iosInterpolationEnabled) {
                 NativePlayerBridge.setProperty(current, "video-sync", "display-resample")
                 NativePlayerBridge.setProperty(current, "interpolation", "yes")
@@ -531,9 +513,7 @@ internal class NativePlayerController(
                 if (eq <= 0) return@forEach
                 val name = trimmed.substring(0, eq).trim()
                 val value = trimmed.substring(eq + 1).trim()
-                if (name.isNotBlank()) {
-                    NativePlayerBridge.setProperty(current, name, value)
-                }
+                if (name.isNotBlank()) NativePlayerBridge.setProperty(current, name, value)
             }
         }
     }
@@ -545,6 +525,10 @@ internal class NativePlayerController(
         }.getOrDefault(emptyList())
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers (محفوظة كما هي)
+// ─────────────────────────────────────────────────────────────────────────────
 
 @Serializable
 private data class NativeMpvTrack(
@@ -558,40 +542,24 @@ private data class NativeMpvTrack(
 
 private fun resolveTrackId(index: Int, tracks: List<NativeMpvTrack>): Int? =
     tracks.firstNotNullOfOrNull { track ->
-        if (track.index == index) {
-            track.id.toIntOrNull()
-        } else {
-            null
-        }
+        if (track.index == index) track.id.toIntOrNull() else null
     } ?: tracks.getOrNull(index)?.id?.toIntOrNull()
 
 private fun Color.toMpvColorString(): String {
-    val alphaInt = (alpha * 255f).toInt().coerceIn(0, 255)
-    val redInt = (red * 255f).toInt().coerceIn(0, 255)
-    val greenInt = (green * 255f).toInt().coerceIn(0, 255)
-    val blueInt = (blue * 255f).toInt().coerceIn(0, 255)
-    return buildString {
-        append('#')
-        append(alphaInt.toHexByte())
-        append(redInt.toHexByte())
-        append(greenInt.toHexByte())
-        append(blueInt.toHexByte())
-    }
+    val a = (alpha * 255f).toInt().coerceIn(0, 255)
+    val r = (red * 255f).toInt().coerceIn(0, 255)
+    val g = (green * 255f).toInt().coerceIn(0, 255)
+    val b = (blue * 255f).toInt().coerceIn(0, 255)
+    return "#${a.toHexByte()}${r.toHexByte()}${g.toHexByte()}${b.toHexByte()}"
 }
 
-private fun SubtitleStyleState.toMpvSubtitlePosition(): Int =
-    (100 - (bottomOffset / 2)).coerceIn(0, 150)
-
-private fun SubtitleStyleState.toMpvSubtitleFontSize(): Float =
-    (fontSizeSp * 3f).coerceIn(24f, 96f)
+private fun SubtitleStyleState.toMpvSubtitlePosition(): Int = (100 - (bottomOffset / 2)).coerceIn(0, 150)
+private fun SubtitleStyleState.toMpvSubtitleFontSize(): Float = (fontSizeSp * 3f).coerceIn(24f, 96f)
 
 private fun Int.toHexByte(): String {
     val digits = "0123456789ABCDEF"
-    val value = coerceIn(0, 255)
-    return buildString {
-        append(digits[value / 16])
-        append(digits[value % 16])
-    }
+    val v = coerceIn(0, 255)
+    return "${digits[v / 16]}${digits[v % 16]}"
 }
 
 private data class PendingSource(
@@ -606,20 +574,15 @@ private data class PendingSource(
 
 private fun Map<String, String>.toHeaderLines(): List<String> =
     entries.mapNotNull { (key, value) ->
-        val cleanKey = key.trim()
-        val cleanValue = value.trim()
-        if (cleanKey.isBlank() || cleanValue.isBlank()) {
-            null
-        } else {
-            "$cleanKey: $cleanValue"
-        }
+        val k = key.trim(); val v = value.trim()
+        if (k.isBlank() || v.isBlank()) null else "$k: $v"
     }
 
 private fun List<String>.toHeaderMap(): Map<String, String> =
     mapNotNull { line ->
-        val separator = line.indexOf(':')
-        if (separator <= 0) return@mapNotNull null
-        line.substring(0, separator).trim() to line.substring(separator + 1).trim()
+        val sep = line.indexOf(':')
+        if (sep <= 0) null
+        else line.substring(0, sep).trim() to line.substring(sep + 1).trim()
     }.toMap()
 
 private fun String.toPlayerControlsAction(): PlayerControlsAction? =
@@ -653,481 +616,268 @@ private data class NativeControlsStructureKey(
     val isFullscreen: Boolean,
 )
 
+private fun PlayerControlsState.nativeControlsStructureKey(): PlayerControlsState =
+    copy(isPlaying = false, isLoading = false, durationMs = 0L, positionMs = 0L)
+
+// toControlsJson و appendJsonField helpers محفوظة كما هي من الملف الأصلي
 private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
     buildString {
         append('{')
-        appendJsonField("title", title)
-        append(',')
-        appendJsonField("episodeText", episodeText)
-        append(',')
-        appendJsonField("streamTitle", streamTitle)
-        append(',')
-        appendJsonField("providerName", providerName)
-        append(',')
-        appendJsonField("pauseOverlayWatchingLabel", pauseOverlayWatchingLabel)
-        append(',')
-        appendJsonField("pauseOverlayLogo", pauseOverlayLogo.orEmpty())
-        append(',')
-        appendJsonField("pauseOverlayEpisodeInfo", pauseOverlayEpisodeInfo)
-        append(',')
-        appendJsonField("pauseOverlayEpisodeTitle", pauseOverlayEpisodeTitle)
-        append(',')
-        appendJsonField("pauseOverlayDescription", pauseOverlayDescription)
-        append(',')
-        appendJsonField("resizeModeLabel", resizeModeLabel)
-        append(',')
-        appendJsonField("playbackSpeedLabel", playbackSpeedLabel)
-        append(',')
-        appendJsonField("isFullscreen", isFullscreen)
-        append(',')
-        appendJsonField("volumeLevel", volumeLevel)
-        append(',')
-        appendJsonField("subtitlesLabel", subtitlesLabel)
-        append(',')
-        appendJsonField("audioLabel", audioLabel)
-        append(',')
-        appendJsonField("sourcesLabel", sourcesLabel)
-        append(',')
-        appendJsonField("episodesLabel", episodesLabel)
-        append(',')
-        appendJsonField("externalPlayerLabel", externalPlayerLabel)
-        append(',')
-        appendJsonField("playLabel", playLabel)
-        append(',')
-        appendJsonField("pauseLabel", pauseLabel)
-        append(',')
-        appendJsonField("closeLabel", closeLabel)
-        append(',')
-        appendJsonField("lockLabel", lockLabel)
-        append(',')
-        appendJsonField("unlockLabel", unlockLabel)
-        append(',')
-        appendJsonField("submitIntroLabel", submitIntroLabel)
-        append(',')
-        appendJsonField("videoSettingsLabel", videoSettingsLabel)
-        append(',')
-        appendJsonField("tapToUnlockLabel", tapToUnlockLabel)
-        append(',')
-        appendJsonField("playbackErrorTitle", playbackErrorTitle)
-        append(',')
-        appendJsonField("playbackErrorMessage", playbackErrorMessage)
-        append(',')
-        appendJsonField("playbackErrorActionLabel", playbackErrorActionLabel)
-        append(',')
-        appendJsonField("sourcesPanelTitle", sourcesPanelTitle)
-        append(',')
-        appendJsonField("episodesPanelTitle", episodesPanelTitle)
-        append(',')
-        appendJsonField("streamsPanelTitle", streamsPanelTitle)
-        append(',')
-        appendJsonField("allFilterLabel", allFilterLabel)
-        append(',')
-        appendJsonField("reloadLabel", reloadLabel)
-        append(',')
-        appendJsonField("backLabel", backLabel)
-        append(',')
-        appendJsonField("panelCloseLabel", panelCloseLabel)
-        append(',')
-        appendJsonField("cancelLabel", cancelLabel)
-        append(',')
-        appendJsonField("playingLabel", playingLabel)
-        append(',')
-        appendJsonField("noStreamsLabel", noStreamsLabel)
-        append(',')
-        appendJsonField("noEpisodesLabel", noEpisodesLabel)
-        append(',')
-        appendJsonField("submitIntroPanelTitle", submitIntroPanelTitle)
-        append(',')
-        appendJsonField("submitIntroSegmentTypeLabel", submitIntroSegmentTypeLabel)
-        append(',')
-        appendJsonField("submitIntroSegmentIntroLabel", submitIntroSegmentIntroLabel)
-        append(',')
-        appendJsonField("submitIntroSegmentRecapLabel", submitIntroSegmentRecapLabel)
-        append(',')
-        appendJsonField("submitIntroSegmentOutroLabel", submitIntroSegmentOutroLabel)
-        append(',')
-        appendJsonField("submitIntroStartTimeLabel", submitIntroStartTimeLabel)
-        append(',')
-        appendJsonField("submitIntroEndTimeLabel", submitIntroEndTimeLabel)
-        append(',')
-        appendJsonField("submitIntroCaptureLabel", submitIntroCaptureLabel)
-        append(',')
-        appendJsonField("submitIntroSubmitLabel", submitIntroSubmitLabel)
-        append(',')
-        appendJsonField("p2pConsentTitle", p2pConsentTitle)
-        append(',')
-        appendJsonField("p2pConsentBody", p2pConsentBody)
-        append(',')
-        appendJsonField("p2pConsentEnableLabel", p2pConsentEnableLabel)
-        append(',')
-        appendJsonField("p2pConsentCancelLabel", p2pConsentCancelLabel)
-        append(',')
-        appendJsonField("subtitlesPanelTitle", subtitlesPanelTitle)
-        append(',')
-        appendJsonField("subtitleBuiltInTabLabel", subtitleBuiltInTabLabel)
-        append(',')
-        appendJsonField("subtitleAddonsTabLabel", subtitleAddonsTabLabel)
-        append(',')
-        appendJsonField("subtitleStyleTabLabel", subtitleStyleTabLabel)
-        append(',')
-        appendJsonField("noneLabel", noneLabel)
-        append(',')
-        appendJsonField("fetchSubtitlesLabel", fetchSubtitlesLabel)
-        append(',')
-        appendJsonField("subtitleDelayLabel", subtitleDelayLabel)
-        append(',')
-        appendJsonField("resetLabel", resetLabel)
-        append(',')
-        appendJsonField("autoSyncLabel", autoSyncLabel)
-        append(',')
-        appendJsonField("reloadSmallLabel", reloadSmallLabel)
-        append(',')
-        appendJsonField("captureLineLabel", captureLineLabel)
-        append(',')
-        appendJsonField("selectAddonSubtitleFirstLabel", selectAddonSubtitleFirstLabel)
-        append(',')
-        appendJsonField("loadingSubtitleLinesLabel", loadingSubtitleLinesLabel)
-        append(',')
-        appendJsonField("fontSizeLabel", fontSizeLabel)
-        append(',')
-        appendJsonField("outlineLabel", outlineLabel)
-        append(',')
-        appendJsonField("boldLabel", boldLabel)
-        append(',')
-        appendJsonField("bottomOffsetLabel", bottomOffsetLabel)
-        append(',')
-        appendJsonField("colorLabel", colorLabel)
-        append(',')
-        appendJsonField("textOpacityLabel", textOpacityLabel)
-        append(',')
-        appendJsonField("outlineColorLabel", outlineColorLabel)
-        append(',')
-        appendJsonField("resetDefaultsLabel", resetDefaultsLabel)
-        append(',')
-        appendJsonField("onLabel", onLabel)
-        append(',')
-        appendJsonField("offLabel", offLabel)
-        append(',')
-        appendJsonField("themeAccentColor", themeAccentColor)
-        append(',')
-        appendJsonField("themeAccentStrongColor", themeAccentStrongColor)
-        append(',')
-        appendJsonField("themeOnAccentColor", themeOnAccentColor)
-        append(',')
-        appendJsonField("themeFocusColor", themeFocusColor)
-        append(',')
-        appendJsonField("themeSelectedSurfaceColor", themeSelectedSurfaceColor)
-        append(',')
-        appendJsonField("themeSelectedSurfaceHoverColor", themeSelectedSurfaceHoverColor)
-        append(',')
-        appendJsonField("themeSelectedRingColor", themeSelectedRingColor)
-        append(',')
-        appendJsonField("themeTimelineFillColor", themeTimelineFillColor)
-        append(',')
-        appendJsonField("themeTimelineTrackColor", themeTimelineTrackColor)
-        append(',')
-        appendJsonField("themeBufferingColor", themeBufferingColor)
-        append(',')
-        appendJsonField("themeBufferingTrackColor", themeBufferingTrackColor)
-        append(',')
-        appendJsonField("themeControlForegroundColor", themeControlForegroundColor)
-        append(',')
-        appendJsonField("isPlaying", isPlaying)
-        append(',')
-        appendJsonField("isLoading", isLoading)
-        append(',')
-        appendJsonField("isLocked", isLocked)
-        append(',')
-        appendJsonField("lockedOverlayVisible", lockedOverlayVisible)
-        append(',')
-        appendJsonField("controlsVisible", controlsVisible)
-        append(',')
-        appendJsonArrayField("parentalWarnings", parentalWarnings) { appendParentalWarningJson(it) }
-        append(',')
-        appendJsonField("showParentalGuide", showParentalGuide)
-        append(',')
-        appendJsonField("showOpeningOverlay", showOpeningOverlay)
-        append(',')
-        appendJsonField("openingArtwork", openingArtwork.orEmpty())
-        append(',')
-        appendJsonField("openingLogo", openingLogo.orEmpty())
-        append(',')
-        appendJsonField("openingTitle", openingTitle)
-        append(',')
-        appendJsonField("openingMessage", openingMessage.orEmpty())
-        append(',')
-        appendJsonField("openingProgress", openingProgress)
-        append(',')
-        appendJsonField("skipPromptVisible", skipPromptVisible)
-        append(',')
-        appendJsonField("skipPromptLabel", skipPromptLabel)
-        append(',')
-        appendJsonField("skipPromptStartMs", skipPromptStartMs)
-        append(',')
-        appendJsonField("skipPromptEndMs", skipPromptEndMs)
-        append(',')
-        appendJsonField("skipPromptDismissed", skipPromptDismissed)
-        append(',')
-        appendJsonField("nextEpisodeVisible", nextEpisodeVisible)
-        append(',')
-        appendJsonField("nextEpisodeHeaderLabel", nextEpisodeHeaderLabel)
-        append(',')
-        appendJsonField("nextEpisodeTitle", nextEpisodeTitle)
-        append(',')
-        appendJsonField("nextEpisodeThumbnail", nextEpisodeThumbnail)
-        append(',')
-        appendJsonField("nextEpisodeStatus", nextEpisodeStatus)
-        append(',')
-        appendJsonField("nextEpisodeActionLabel", nextEpisodeActionLabel)
-        append(',')
-        appendJsonField("nextEpisodePlayable", nextEpisodePlayable)
-        append(',')
-        appendJsonField("showSubmitIntro", showSubmitIntro)
-        append(',')
-        appendJsonField("showVideoSettings", showVideoSettings)
-        append(',')
-        appendJsonField("showSources", showSources)
-        append(',')
-        appendJsonField("showEpisodes", showEpisodes)
-        append(',')
-        appendJsonField("showExternalPlayer", showExternalPlayer)
-        append(',')
-        appendJsonField("durationMs", durationMs)
-        append(',')
-        appendJsonField("positionMs", positionMs)
-        append(',')
-        appendJsonField("sourceIsLoading", sourceIsLoading)
-        append(',')
-        appendJsonArrayField("sourceFilters", sourceFilters) { appendFilterItemJson(it) }
-        append(',')
-        appendJsonArrayField("sourceItems", sourceItems) { appendSourceItemJson(it) }
-        append(',')
-        appendJsonArrayField("episodeItems", episodeItems) { appendEpisodeItemJson(it) }
-        append(',')
-        appendJsonArrayField("episodeSeasons", episodeSeasons) { appendSeasonItemJson(it) }
-        append(',')
-        appendJsonField("episodeStreamsVisible", episodeStreamsVisible)
-        append(',')
-        appendJsonField("episodeStreamsIsLoading", episodeStreamsIsLoading)
-        append(',')
-        appendJsonField("selectedEpisodeLabel", selectedEpisodeLabel)
-        append(',')
-        appendJsonArrayField("episodeStreamFilters", episodeStreamFilters) { appendFilterItemJson(it) }
-        append(',')
-        appendJsonArrayField("episodeStreamItems", episodeStreamItems) { appendSourceItemJson(it) }
-        append(',')
-        appendJsonField("submitIntroSegmentType", submitIntroSegmentType)
-        append(',')
-        appendJsonField("submitIntroStartTime", submitIntroStartTime)
-        append(',')
-        appendJsonField("submitIntroEndTime", submitIntroEndTime)
-        append(',')
-        appendJsonField("isSubmitIntroSubmitting", isSubmitIntroSubmitting)
-        append(',')
-        appendJsonField("submitIntroStatusMessage", submitIntroStatusMessage)
-        append(',')
-        appendJsonField("showP2pConsent", showP2pConsent)
-        append(',')
-        appendJsonField("subtitleActiveTab", subtitleActiveTab)
-        append(',')
-        appendJsonArrayField("addonSubtitleItems", addonSubtitleItems) { appendAddonSubtitleItemJson(it) }
-        append(',')
-        appendJsonField("isLoadingAddonSubtitles", isLoadingAddonSubtitles)
-        append(',')
-        appendJsonField("selectedAddonSubtitleId", selectedAddonSubtitleId)
-        append(',')
-        appendJsonField("useCustomSubtitles", useCustomSubtitles)
-        append(',')
-        appendJsonField("subtitleDelayMs", subtitleDelayMs)
-        append(',')
-        appendJsonField("hasSelectedAddonSubtitle", hasSelectedAddonSubtitle)
-        append(',')
-        appendJsonField("subtitleAutoSyncCapturedPositionMs", subtitleAutoSyncCapturedPositionMs)
-        append(',')
-        appendJsonArrayField("subtitleAutoSyncCues", subtitleAutoSyncCues) { appendSubtitleCueItemJson(it) }
-        append(',')
-        appendJsonField("subtitleAutoSyncIsLoading", subtitleAutoSyncIsLoading)
-        append(',')
-        appendJsonField("subtitleAutoSyncErrorMessage", subtitleAutoSyncErrorMessage)
-        append(',')
-        appendJsonField("subtitleStyle", subtitleStyle)
-        append(',')
-        appendJsonArrayField("subtitleColorSwatches", SubtitleColorSwatches.map { it.toStorageHexString() }) { append(it.toJsonString()) }
-        append(',')
+        appendJsonField("title", title); append(',')
+        appendJsonField("episodeText", episodeText); append(',')
+        appendJsonField("streamTitle", streamTitle); append(',')
+        appendJsonField("providerName", providerName); append(',')
+        appendJsonField("pauseOverlayWatchingLabel", pauseOverlayWatchingLabel); append(',')
+        appendJsonField("pauseOverlayLogo", pauseOverlayLogo.orEmpty()); append(',')
+        appendJsonField("pauseOverlayEpisodeInfo", pauseOverlayEpisodeInfo); append(',')
+        appendJsonField("pauseOverlayEpisodeTitle", pauseOverlayEpisodeTitle); append(',')
+        appendJsonField("pauseOverlayDescription", pauseOverlayDescription); append(',')
+        appendJsonField("resizeModeLabel", resizeModeLabel); append(',')
+        appendJsonField("playbackSpeedLabel", playbackSpeedLabel); append(',')
+        appendJsonField("isFullscreen", isFullscreen); append(',')
+        appendJsonField("volumeLevel", volumeLevel); append(',')
+        appendJsonField("subtitlesLabel", subtitlesLabel); append(',')
+        appendJsonField("audioLabel", audioLabel); append(',')
+        appendJsonField("sourcesLabel", sourcesLabel); append(',')
+        appendJsonField("episodesLabel", episodesLabel); append(',')
+        appendJsonField("externalPlayerLabel", externalPlayerLabel); append(',')
+        appendJsonField("playLabel", playLabel); append(',')
+        appendJsonField("pauseLabel", pauseLabel); append(',')
+        appendJsonField("closeLabel", closeLabel); append(',')
+        appendJsonField("lockLabel", lockLabel); append(',')
+        appendJsonField("unlockLabel", unlockLabel); append(',')
+        appendJsonField("submitIntroLabel", submitIntroLabel); append(',')
+        appendJsonField("videoSettingsLabel", videoSettingsLabel); append(',')
+        appendJsonField("tapToUnlockLabel", tapToUnlockLabel); append(',')
+        appendJsonField("playbackErrorTitle", playbackErrorTitle); append(',')
+        appendJsonField("playbackErrorMessage", playbackErrorMessage); append(',')
+        appendJsonField("playbackErrorActionLabel", playbackErrorActionLabel); append(',')
+        appendJsonField("sourcesPanelTitle", sourcesPanelTitle); append(',')
+        appendJsonField("episodesPanelTitle", episodesPanelTitle); append(',')
+        appendJsonField("streamsPanelTitle", streamsPanelTitle); append(',')
+        appendJsonField("allFilterLabel", allFilterLabel); append(',')
+        appendJsonField("reloadLabel", reloadLabel); append(',')
+        appendJsonField("backLabel", backLabel); append(',')
+        appendJsonField("panelCloseLabel", panelCloseLabel); append(',')
+        appendJsonField("cancelLabel", cancelLabel); append(',')
+        appendJsonField("playingLabel", playingLabel); append(',')
+        appendJsonField("noStreamsLabel", noStreamsLabel); append(',')
+        appendJsonField("noEpisodesLabel", noEpisodesLabel); append(',')
+        appendJsonField("submitIntroPanelTitle", submitIntroPanelTitle); append(',')
+        appendJsonField("submitIntroSegmentTypeLabel", submitIntroSegmentTypeLabel); append(',')
+        appendJsonField("submitIntroSegmentIntroLabel", submitIntroSegmentIntroLabel); append(',')
+        appendJsonField("submitIntroSegmentRecapLabel", submitIntroSegmentRecapLabel); append(',')
+        appendJsonField("submitIntroSegmentOutroLabel", submitIntroSegmentOutroLabel); append(',')
+        appendJsonField("submitIntroStartTimeLabel", submitIntroStartTimeLabel); append(',')
+        appendJsonField("submitIntroEndTimeLabel", submitIntroEndTimeLabel); append(',')
+        appendJsonField("submitIntroCaptureLabel", submitIntroCaptureLabel); append(',')
+        appendJsonField("submitIntroSubmitLabel", submitIntroSubmitLabel); append(',')
+        appendJsonField("p2pConsentTitle", p2pConsentTitle); append(',')
+        appendJsonField("p2pConsentBody", p2pConsentBody); append(',')
+        appendJsonField("p2pConsentEnableLabel", p2pConsentEnableLabel); append(',')
+        appendJsonField("p2pConsentCancelLabel", p2pConsentCancelLabel); append(',')
+        appendJsonField("subtitlesPanelTitle", subtitlesPanelTitle); append(',')
+        appendJsonField("subtitleBuiltInTabLabel", subtitleBuiltInTabLabel); append(',')
+        appendJsonField("subtitleAddonsTabLabel", subtitleAddonsTabLabel); append(',')
+        appendJsonField("subtitleStyleTabLabel", subtitleStyleTabLabel); append(',')
+        appendJsonField("noneLabel", noneLabel); append(',')
+        appendJsonField("fetchSubtitlesLabel", fetchSubtitlesLabel); append(',')
+        appendJsonField("subtitleDelayLabel", subtitleDelayLabel); append(',')
+        appendJsonField("resetLabel", resetLabel); append(',')
+        appendJsonField("autoSyncLabel", autoSyncLabel); append(',')
+        appendJsonField("reloadSmallLabel", reloadSmallLabel); append(',')
+        appendJsonField("captureLineLabel", captureLineLabel); append(',')
+        appendJsonField("selectAddonSubtitleFirstLabel", selectAddonSubtitleFirstLabel); append(',')
+        appendJsonField("loadingSubtitleLinesLabel", loadingSubtitleLinesLabel); append(',')
+        appendJsonField("fontSizeLabel", fontSizeLabel); append(',')
+        appendJsonField("outlineLabel", outlineLabel); append(',')
+        appendJsonField("boldLabel", boldLabel); append(',')
+        appendJsonField("bottomOffsetLabel", bottomOffsetLabel); append(',')
+        appendJsonField("colorLabel", colorLabel); append(',')
+        appendJsonField("textOpacityLabel", textOpacityLabel); append(',')
+        appendJsonField("outlineColorLabel", outlineColorLabel); append(',')
+        appendJsonField("resetDefaultsLabel", resetDefaultsLabel); append(',')
+        appendJsonField("onLabel", onLabel); append(',')
+        appendJsonField("offLabel", offLabel); append(',')
+        appendJsonField("themeAccentColor", themeAccentColor); append(',')
+        appendJsonField("themeAccentStrongColor", themeAccentStrongColor); append(',')
+        appendJsonField("themeOnAccentColor", themeOnAccentColor); append(',')
+        appendJsonField("themeFocusColor", themeFocusColor); append(',')
+        appendJsonField("themeSelectedSurfaceColor", themeSelectedSurfaceColor); append(',')
+        appendJsonField("themeSelectedSurfaceHoverColor", themeSelectedSurfaceHoverColor); append(',')
+        appendJsonField("themeSelectedRingColor", themeSelectedRingColor); append(',')
+        appendJsonField("themeTimelineFillColor", themeTimelineFillColor); append(',')
+        appendJsonField("themeTimelineTrackColor", themeTimelineTrackColor); append(',')
+        appendJsonField("themeBufferingColor", themeBufferingColor); append(',')
+        appendJsonField("themeBufferingTrackColor", themeBufferingTrackColor); append(',')
+        appendJsonField("themeControlForegroundColor", themeControlForegroundColor); append(',')
+        appendJsonField("isPlaying", isPlaying); append(',')
+        appendJsonField("isLoading", isLoading); append(',')
+        appendJsonField("isLocked", isLocked); append(',')
+        appendJsonField("lockedOverlayVisible", lockedOverlayVisible); append(',')
+        appendJsonField("controlsVisible", controlsVisible); append(',')
+        appendJsonArrayField("parentalWarnings", parentalWarnings) { appendParentalWarningJson(it) }; append(',')
+        appendJsonField("showParentalGuide", showParentalGuide); append(',')
+        appendJsonField("showOpeningOverlay", showOpeningOverlay); append(',')
+        appendJsonField("openingArtwork", openingArtwork.orEmpty()); append(',')
+        appendJsonField("openingLogo", openingLogo.orEmpty()); append(',')
+        appendJsonField("openingTitle", openingTitle); append(',')
+        appendJsonField("openingMessage", openingMessage.orEmpty()); append(',')
+        appendJsonField("openingProgress", openingProgress); append(',')
+        appendJsonField("skipPromptVisible", skipPromptVisible); append(',')
+        appendJsonField("skipPromptLabel", skipPromptLabel); append(',')
+        appendJsonField("skipPromptStartMs", skipPromptStartMs); append(',')
+        appendJsonField("skipPromptEndMs", skipPromptEndMs); append(',')
+        appendJsonField("skipPromptDismissed", skipPromptDismissed); append(',')
+        appendJsonField("nextEpisodeVisible", nextEpisodeVisible); append(',')
+        appendJsonField("nextEpisodeHeaderLabel", nextEpisodeHeaderLabel); append(',')
+        appendJsonField("nextEpisodeTitle", nextEpisodeTitle); append(',')
+        appendJsonField("nextEpisodeThumbnail", nextEpisodeThumbnail); append(',')
+        appendJsonField("nextEpisodeStatus", nextEpisodeStatus); append(',')
+        appendJsonField("nextEpisodeActionLabel", nextEpisodeActionLabel); append(',')
+        appendJsonField("nextEpisodePlayable", nextEpisodePlayable); append(',')
+        appendJsonField("showSubmitIntro", showSubmitIntro); append(',')
+        appendJsonField("showVideoSettings", showVideoSettings); append(',')
+        appendJsonField("showSources", showSources); append(',')
+        appendJsonField("showEpisodes", showEpisodes); append(',')
+        appendJsonField("showExternalPlayer", showExternalPlayer); append(',')
+        appendJsonField("durationMs", durationMs); append(',')
+        appendJsonField("positionMs", positionMs); append(',')
+        appendJsonField("sourceIsLoading", sourceIsLoading); append(',')
+        appendJsonArrayField("sourceFilters", sourceFilters) { appendFilterItemJson(it) }; append(',')
+        appendJsonArrayField("sourceItems", sourceItems) { appendSourceItemJson(it) }; append(',')
+        appendJsonArrayField("episodeItems", episodeItems) { appendEpisodeItemJson(it) }; append(',')
+        appendJsonArrayField("episodeSeasons", episodeSeasons) { appendSeasonItemJson(it) }; append(',')
+        appendJsonField("episodeStreamsVisible", episodeStreamsVisible); append(',')
+        appendJsonField("episodeStreamsIsLoading", episodeStreamsIsLoading); append(',')
+        appendJsonField("selectedEpisodeLabel", selectedEpisodeLabel); append(',')
+        appendJsonArrayField("episodeStreamFilters", episodeStreamFilters) { appendFilterItemJson(it) }; append(',')
+        appendJsonArrayField("episodeStreamItems", episodeStreamItems) { appendSourceItemJson(it) }; append(',')
+        appendJsonField("submitIntroSegmentType", submitIntroSegmentType); append(',')
+        appendJsonField("submitIntroStartTime", submitIntroStartTime); append(',')
+        appendJsonField("submitIntroEndTime", submitIntroEndTime); append(',')
+        appendJsonField("isSubmitIntroSubmitting", isSubmitIntroSubmitting); append(',')
+        appendJsonField("submitIntroStatusMessage", submitIntroStatusMessage); append(',')
+        appendJsonField("showP2pConsent", showP2pConsent); append(',')
+        appendJsonField("subtitleActiveTab", subtitleActiveTab); append(',')
+        appendJsonArrayField("addonSubtitleItems", addonSubtitleItems) { appendAddonSubtitleItemJson(it) }; append(',')
+        appendJsonField("isLoadingAddonSubtitles", isLoadingAddonSubtitles); append(',')
+        appendJsonField("selectedAddonSubtitleId", selectedAddonSubtitleId); append(',')
+        appendJsonField("useCustomSubtitles", useCustomSubtitles); append(',')
+        appendJsonField("subtitleDelayMs", subtitleDelayMs); append(',')
+        appendJsonField("hasSelectedAddonSubtitle", hasSelectedAddonSubtitle); append(',')
+        appendJsonField("subtitleAutoSyncCapturedPositionMs", subtitleAutoSyncCapturedPositionMs); append(',')
+        appendJsonArrayField("subtitleAutoSyncCues", subtitleAutoSyncCues) { appendSubtitleCueItemJson(it) }; append(',')
+        appendJsonField("subtitleAutoSyncIsLoading", subtitleAutoSyncIsLoading); append(',')
+        appendJsonField("subtitleAutoSyncErrorMessage", subtitleAutoSyncErrorMessage); append(',')
+        appendJsonField("subtitleStyle", subtitleStyle); append(',')
+        appendJsonArrayField("subtitleColorSwatches", SubtitleColorSwatches.map { it.toStorageHexString() }) { append(it.toJsonString()) }; append(',')
         appendJsonField("closeModalsToken", closeModalsToken)
         append('}')
     }
-
-private fun PlayerControlsState.nativeControlsStructureKey(): PlayerControlsState =
-    copy(
-        isPlaying = false,
-        isLoading = false,
-        durationMs = 0L,
-        positionMs = 0L,
-    )
 
 private fun StringBuilder.appendJsonField(name: String, value: String) {
     append('"').append(name).append("\":")
     append(value.toJsonString())
 }
-
 private fun StringBuilder.appendJsonField(name: String, value: Boolean) {
     append('"').append(name).append("\":").append(value)
 }
-
 private fun StringBuilder.appendJsonField(name: String, value: Long) {
     append('"').append(name).append("\":").append(value)
 }
-
 private fun StringBuilder.appendJsonField(name: String, value: Float?) {
     append('"').append(name).append("\":")
-    if (value == null || value.isNaN() || value.isInfinite()) {
-        append("null")
-    } else {
-        append(value.coerceIn(0f, 1f))
-    }
+    if (value == null || value.isNaN() || value.isInfinite()) append("null")
+    else append(value.coerceIn(0f, 1f))
 }
-
 private fun StringBuilder.appendJsonField(name: String, value: Int) {
     append('"').append(name).append("\":").append(value)
 }
-
 private fun StringBuilder.appendJsonField(name: String, value: SubtitleStyleState) {
     append('"').append(name).append("\":")
     appendSubtitleStyleJson(value)
 }
-
-private inline fun <T> StringBuilder.appendJsonArrayField(
-    name: String,
-    values: List<T>,
-    appendValue: StringBuilder.(T) -> Unit,
-) {
+private inline fun <T> StringBuilder.appendJsonArrayField(name: String, values: List<T>, appendValue: StringBuilder.(T) -> Unit) {
     append('"').append(name).append("\":[")
-    values.forEachIndexed { index, value ->
-        if (index > 0) append(',')
-        appendValue(value)
-    }
+    values.forEachIndexed { index, value -> if (index > 0) append(','); appendValue(value) }
     append(']')
 }
-
 private fun StringBuilder.appendFilterItemJson(item: PlayerControlFilterItem) {
     append('{')
-    appendJsonField("id", item.id)
-    append(',')
-    appendJsonField("label", item.label)
-    append(',')
-    appendJsonField("isSelected", item.isSelected)
-    append(',')
-    appendJsonField("isLoading", item.isLoading)
-    append(',')
+    appendJsonField("id", item.id); append(',')
+    appendJsonField("label", item.label); append(',')
+    appendJsonField("isSelected", item.isSelected); append(',')
+    appendJsonField("isLoading", item.isLoading); append(',')
     appendJsonField("hasError", item.hasError)
     append('}')
 }
-
 private fun StringBuilder.appendSeasonItemJson(item: PlayerControlSeasonItem) {
     append('{')
-    appendJsonField("season", item.season)
-    append(',')
-    appendJsonField("label", item.label)
-    append(',')
+    appendJsonField("season", item.season); append(',')
+    appendJsonField("label", item.label); append(',')
     appendJsonField("isSelected", item.isSelected)
     append('}')
 }
-
 private fun StringBuilder.appendSourceItemJson(item: PlayerControlSourceItem) {
     append('{')
-    appendJsonField("index", item.index)
-    append(',')
-    appendJsonField("filterId", item.filterId)
-    append(',')
-    appendJsonField("label", item.label)
-    append(',')
-    appendJsonField("subtitle", item.subtitle)
-    append(',')
-    appendJsonField("addonName", item.addonName)
-    append(',')
-    appendJsonField("isCurrent", item.isCurrent)
-    append(',')
+    appendJsonField("index", item.index); append(',')
+    appendJsonField("filterId", item.filterId); append(',')
+    appendJsonField("label", item.label); append(',')
+    appendJsonField("subtitle", item.subtitle); append(',')
+    appendJsonField("addonName", item.addonName); append(',')
+    appendJsonField("isCurrent", item.isCurrent); append(',')
     appendJsonField("isEnabled", item.isEnabled)
     append('}')
 }
-
 private fun StringBuilder.appendEpisodeItemJson(item: PlayerControlEpisodeItem) {
     append('{')
-    appendJsonField("index", item.index)
-    append(',')
-    appendJsonField("id", item.id)
-    append(',')
-    appendJsonField("title", item.title)
-    append(',')
-    appendJsonField("code", item.code)
-    append(',')
-    appendJsonField("overview", item.overview)
-    append(',')
-    appendJsonField("thumbnail", item.thumbnail)
-    append(',')
-    appendJsonField("season", item.season)
-    append(',')
-    appendJsonField("episode", item.episode)
-    append(',')
-    appendJsonField("isCurrent", item.isCurrent)
-    append(',')
+    appendJsonField("index", item.index); append(',')
+    appendJsonField("id", item.id); append(',')
+    appendJsonField("title", item.title); append(',')
+    appendJsonField("code", item.code); append(',')
+    appendJsonField("overview", item.overview); append(',')
+    appendJsonField("thumbnail", item.thumbnail); append(',')
+    appendJsonField("season", item.season); append(',')
+    appendJsonField("episode", item.episode); append(',')
+    appendJsonField("isCurrent", item.isCurrent); append(',')
     appendJsonField("isWatched", item.isWatched)
     append('}')
 }
-
 private fun StringBuilder.appendAddonSubtitleItemJson(item: PlayerControlAddonSubtitleItem) {
     append('{')
-    appendJsonField("index", item.index)
-    append(',')
-    appendJsonField("id", item.id)
-    append(',')
-    appendJsonField("display", item.display)
-    append(',')
-    appendJsonField("languageLabel", item.languageLabel)
-    append(',')
-    appendJsonField("addonName", item.addonName)
-    append(',')
+    appendJsonField("index", item.index); append(',')
+    appendJsonField("id", item.id); append(',')
+    appendJsonField("display", item.display); append(',')
+    appendJsonField("languageLabel", item.languageLabel); append(',')
+    appendJsonField("addonName", item.addonName); append(',')
     appendJsonField("isSelected", item.isSelected)
     append('}')
 }
-
 private fun StringBuilder.appendSubtitleCueItemJson(item: PlayerControlSubtitleCueItem) {
     append('{')
-    appendJsonField("index", item.index)
-    append(',')
-    appendJsonField("timeMs", item.timeMs)
-    append(',')
-    appendJsonField("timeLabel", item.timeLabel)
-    append(',')
+    appendJsonField("index", item.index); append(',')
+    appendJsonField("timeMs", item.timeMs); append(',')
+    appendJsonField("timeLabel", item.timeLabel); append(',')
     appendJsonField("text", item.text)
     append('}')
 }
-
 private fun StringBuilder.appendParentalWarningJson(item: ParentalWarning) {
     append('{')
-    appendJsonField("label", item.label)
-    append(',')
+    appendJsonField("label", item.label); append(',')
     appendJsonField("severity", item.severity)
     append('}')
 }
-
 private fun StringBuilder.appendSubtitleStyleJson(style: SubtitleStyleState) {
     append('{')
-    appendJsonField("textColor", style.textColor.toStorageHexString())
-    append(',')
-    appendJsonField("outlineColor", style.outlineColor.toStorageHexString())
-    append(',')
-    appendJsonField("outlineEnabled", style.outlineEnabled)
-    append(',')
-    appendJsonField("bold", style.bold)
-    append(',')
-    appendJsonField("fontSizeSp", style.fontSizeSp)
-    append(',')
+    appendJsonField("textColor", style.textColor.toStorageHexString()); append(',')
+    appendJsonField("outlineColor", style.outlineColor.toStorageHexString()); append(',')
+    appendJsonField("outlineEnabled", style.outlineEnabled); append(',')
+    appendJsonField("bold", style.bold); append(',')
+    appendJsonField("fontSizeSp", style.fontSizeSp); append(',')
     appendJsonField("bottomOffset", style.bottomOffset)
     append('}')
 }
-
 private fun String.toJsonString(): String =
     buildString(length + 2) {
         append('"')
@@ -1140,14 +890,7 @@ private fun String.toJsonString(): String =
                 '\n' -> append("\\n")
                 '\r' -> append("\\r")
                 '\t' -> append("\\t")
-                else -> {
-                    if (char.code < 0x20) {
-                        append("\\u")
-                        append(char.code.toString(16).padStart(4, '0'))
-                    } else {
-                        append(char)
-                    }
-                }
+                else -> if (char.code < 0x20) append("\\u${char.code.toString(16).padStart(4, '0')}") else append(char)
             }
         }
         append('"')
