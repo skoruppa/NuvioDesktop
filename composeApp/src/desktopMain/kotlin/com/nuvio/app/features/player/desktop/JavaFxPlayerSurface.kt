@@ -15,6 +15,9 @@ import javafx.scene.image.PixelFormat
 import javafx.scene.layout.StackPane
 import javafx.scene.web.WebEngine
 import javafx.scene.web.WebView
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import netscape.javascript.JSObject
 import java.awt.KeyboardFocusManager
 import java.awt.Point
@@ -355,16 +358,18 @@ private class JavaFxSurfaceState(
 private class JavaFxPlayerBridge(
     private val onEvent: (type: String, value: Double) -> Unit,
 ) {
+    private val json = Json { ignoreUnknownKeys = true }
+
     @Suppress("unused")
     fun postMessage(jsonStr: String) {
         try {
-            val clean = jsonStr.trim()
-            val typeMatch = Regex("\"type\"\\s*:\\s*\"([^\"]+)\"").find(clean)
-            val valueMatch = Regex("\"value\"\\s*:\\s*([0-9.]+)").find(clean)
-            val type = typeMatch?.groupValues?.get(1) ?: return
-            val value = valueMatch?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
+            val obj = json.decodeFromString<JsonObject>(jsonStr.trim())
+            val type = obj["type"]?.jsonPrimitive?.content ?: return
+            val value = obj["value"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0
+            System.err.println("[JAVAFX] bridge event: type=$type value=$value")
             onEvent(type, value)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            System.err.println("[JAVAFX] bridge parse error: ${e.message}")
         }
     }
 }
