@@ -1627,7 +1627,34 @@ private fun MainAppContent(
                                         animateHomeCollectionGifs = tabsRouteActive,
                                         onCatalogClick = onCatalogClick,
                                         onPosterClick = { meta ->
-                                            navController.navigate(DetailRoute(type = meta.type, id = meta.id))
+                                            if (meta.type == "movie") {
+                                                val bg = meta.banner
+                                                val streamLaunchId = StreamLaunchStore.put(
+                                                    StreamLaunch(
+                                                        profileId = activePlaybackProfileId,
+                                                        type = meta.type,
+                                                        videoId = meta.id,
+                                                        parentMetaId = meta.id,
+                                                        parentMetaType = meta.type,
+                                                        title = meta.name,
+                                                        logo = meta.logo,
+                                                        poster = meta.poster,
+                                                        background = bg,
+                                                        seasonNumber = null,
+                                                        episodeNumber = null,
+                                                        episodeTitle = null,
+                                                        episodeThumbnail = null,
+                                                        pauseDescription = null,
+                                                        resumePositionMs = null,
+                                                        resumeProgressFraction = null,
+                                                        manualSelection = false,
+                                                        startFromBeginning = false,
+                                                    ),
+                                                )
+                                                navController.navigate(StreamRoute(launchId = streamLaunchId))
+                                            } else {
+                                                navController.navigate(DetailRoute(type = meta.type, id = meta.id))
+                                            }
                                         },
                                         onPosterLongClick = { meta ->
                                             openPosterActions(PosterActionTarget(preview = meta))
