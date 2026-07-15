@@ -170,7 +170,8 @@ internal class NativePlayerController(
                 "speed=${stateWithVolume.playbackSpeedLabel} audioLabel=${stateWithVolume.audioLabel} " +
                 "subsLabel=${stateWithVolume.subtitlesLabel} fullscreen=$isFullscreen"
         }
-        NativePlayerBridge.updateControls(current, stateWithVolume.toControlsJson(isFullscreen))
+        val controlsJson = stateWithVolume.toControlsJson(isFullscreen)
+        NativePlayerBridge.updateControls(current, controlsJson)
     }
 
     fun onDesktopFullscreenChanged() {

@@ -40,6 +40,7 @@ internal object NativePlayerBridge {
 
     external fun dispose(handle: Long)
     external fun updateControls(handle: Long, controlsJson: String)
+    external fun updateOverlayPixels(handle: Long, pixels: java.nio.ByteBuffer, width: Int, height: Int)
     external fun requestFocus(handle: Long)
     external fun setPaused(handle: Long, paused: Boolean)
     external fun seekTo(handle: Long, positionMs: Long)
@@ -92,6 +93,12 @@ internal object NativePlayerBridge {
     )
     external fun warmupWebView2(controlsPageUrl: String): Boolean
     external fun shutdownWebView2Warmup()
+    external fun loadLibraryGlobal(path: String)
+
+    /** Must be called BEFORE any AWT/Compose/Skia initialization on Linux. */
+    @JvmStatic
+    external fun initGtkEarly(): Boolean
+
 
     val controlsPageUrl: String by lazy { controlsPageAssets.url }
     private val controlsPageAssets: ControlsPageAssets by lazy { exportControlsPageAssets() }
@@ -123,7 +130,7 @@ internal object NativePlayerBridge {
 
     private fun loadNativeLibrary() {
         val platform = DesktopHostOs.current
-        require(platform == DesktopHostOs.MACOS || platform == DesktopHostOs.WINDOWS) {
+        require(platform == DesktopHostOs.MACOS || platform == DesktopHostOs.WINDOWS || platform == DesktopHostOs.LINUX) {
             "Native desktop playback is not implemented for $platform yet."
         }
 
@@ -318,7 +325,7 @@ internal object NativePlayerBridge {
 }
 
 internal fun preloadNativePlayerBridgeAsync() {
-    if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS) {
+    if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS || DesktopHostOs.current == DesktopHostOs.LINUX) {
         runCatching {
             NativePlayerBridge.preloadAsync()
         }

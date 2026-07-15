@@ -522,6 +522,7 @@ val generateRuntimeConfigs = tasks.register<GenerateRuntimeConfigsTask>("generat
 
 val isMacHost = System.getProperty("os.name").contains("mac", ignoreCase = true)
 val isWindowsHost = System.getProperty("os.name").contains("win", ignoreCase = true)
+val isLinuxHost = System.getProperty("os.name").contains("linux", ignoreCase = true)
 val mpvKitDir = providers.gradleProperty("nuvio.mpvkit.dir")
     .orElse(rootProject.layout.projectDirectory.dir("MPVKit").asFile.absolutePath)
 val macosPlayerBridgeSource = layout.projectDirectory.file("src/desktopMain/native/macos/player_bridge.mm")
@@ -865,6 +866,51 @@ abstract class GenerateNativeRuntimeIndexTask : DefaultTask() {
     }
 }
 
+val linuxPlayerBridgeSource = layout.projectDirectory.file("src/desktopMain/native/linux/player_bridge.c")
+val linuxPlayerBridgeOutput = layout.buildDirectory.file("native/linux/libplayer_bridge.so")
+val linuxPlayerBridgeJavaHome = providers.systemProperty("java.home").get()
+if (isLinuxHost) {
+    linuxPlayerBridgeOutput.get().asFile.parentFile.mkdirs()
+}
+val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
+    enabled = isLinuxHost
+    inputs.file(linuxPlayerBridgeSource)
+    outputs.file(linuxPlayerBridgeOutput)
+    val sourceFile = linuxPlayerBridgeSource.asFile
+    val outputFile = linuxPlayerBridgeOutput.get().asFile
+    val javaIncludeDir = File(linuxPlayerBridgeJavaHome, "include")
+    val javaLinuxIncludeDir = File(javaIncludeDir, "linux")
+    commandLine(
+        "gcc",
+        "-shared",
+        "-fPIC",
+        "-std=c11",
+        "-O2",
+        "-Wall",
+        "-Wno-unused-function",
+        "-o", outputFile.absolutePath,
+        sourceFile.absolutePath,
+        "-I${javaIncludeDir.absolutePath}",
+        "-I${javaLinuxIncludeDir.absolutePath}",
+        "-ldl",
+        "-lpthread",
+        "-lEGL",
+    )
+}
+
+val buildLinuxWebKitOverlay = tasks.register<Exec>("buildLinuxWebKitOverlay") {
+    enabled = false /* DISABLED: replaced by JCEF off-screen rendering */
+    val sourceFile = layout.projectDirectory.file("src/desktopMain/native/linux/webkit_overlay.c").asFile
+    val outputFile = linuxPlayerBridgeOutput.get().asFile.parentFile.resolve("webkit_overlay")
+    inputs.file(sourceFile)
+    outputs.file(outputFile)
+    commandLine(
+        "/bin/sh", "-c",
+        "gcc -O2 -o ${outputFile.absolutePath} ${sourceFile.absolutePath} " +
+            "\$(pkg-config --cflags --libs gtk+-3.0 webkit2gtk-4.1) -lX11 -lXcomposite"
+    )
+}
+
 tasks.withType<Jar>().configureEach {
     if (isMacHost && name == "desktopJar") {
         dependsOn(buildMacosPlayerBridge)
@@ -879,6 +925,12 @@ tasks.withType<Jar>().configureEach {
         }
         from(windowsPlayerRuntimeOutput) {
             into("native/windows")
+        }
+    }
+    if (isLinuxHost && name == "desktopJar") {
+        dependsOn(buildLinuxPlayerBridge)
+        from(linuxPlayerBridgeOutput) {
+            into("native/linux")
         }
     }
 }
@@ -908,6 +960,34 @@ if (isWindowsHost) {
     )
     tasks.matching { it.name in desktopNativePlayerTasks }.configureEach {
         dependsOn(buildWindowsPlayerBridge, prepareWindowsPlayerRuntime, generateWindowsPlayerRuntimeIndex)
+    }
+}
+
+if (isLinuxHost) {
+    val desktopNativePlayerTasks = setOf(
+        "run",
+        "runRelease",
+        "desktopRun",
+        "runDistributable",
+        "runReleaseDistributable",
+        "desktopRunHot",
+        "hotRunDesktop",
+        "hotRunDesktopAsync",
+        "hotDevDesktop",
+        "hotDevDesktopAsync",
+        "createDistributable",
+        "createReleaseDistributable",
+        "createRuntimeImage",
+        "package",
+        "packageDistributionForCurrentOS",
+        "packageDeb",
+        "packageUberJarForCurrentOS",
+        "packageReleaseDistributionForCurrentOS",
+        "packageReleaseDeb",
+        "packageReleaseUberJarForCurrentOS",
+    )
+    tasks.matching { it.name in desktopNativePlayerTasks }.configureEach {
+        dependsOn(buildLinuxPlayerBridge, buildLinuxWebKitOverlay)
     }
 }
 
@@ -1064,10 +1144,15 @@ compose.desktop {
             ?: System.getenv("NUVIO_DESKTOP_SMOKE_PLAYER_URL")
         jvmArgs += listOfNotNull(
             "-Dapple.awt.application.appearance=NSAppearanceNameDarkAqua",
+            "-Djdk.gtk.version=0",
             "--add-opens=java.desktop/java.awt=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.lwawt.macosx=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.awt.windows=ALL-UNNAMED",
+            "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED",
+            "--add-exports=java.base/java.lang=ALL-UNNAMED",
+            "--add-exports=java.desktop/sun.awt=ALL-UNNAMED",
+            "--add-exports=java.desktop/sun.java2d=ALL-UNNAMED",
             smokePlayerUrl?.takeIf { it.isNotBlank() }?.let { "-Dnuvio.desktop.smokePlayerUrl=$it" },
         )
 

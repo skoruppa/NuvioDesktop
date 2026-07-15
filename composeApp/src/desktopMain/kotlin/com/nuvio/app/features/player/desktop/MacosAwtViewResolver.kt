@@ -9,6 +9,7 @@ internal object AwtNativeViewResolver {
         when (DesktopHostOs.current) {
             DesktopHostOs.MACOS -> MacosAwtViewResolver.resolveNativeViewPointer(component)
             DesktopHostOs.WINDOWS -> WindowsAwtViewResolver.resolveNativeViewPointer(component)
+            DesktopHostOs.LINUX -> LinuxAwtViewResolver.resolveNativeViewPointer(component)
             else -> error("Native desktop playback is not implemented for ${DesktopHostOs.current}.")
         }
 }
@@ -79,4 +80,42 @@ private object WindowsAwtViewResolver {
 
     private fun invokeLong(target: Any, methodName: String): Long =
         (findMethod(target.javaClass, methodName).invoke(target) as Number).toLong()
+}
+
+private object LinuxAwtViewResolver {
+    private val componentPeerField: Field by lazy {
+        Component::class.java.getDeclaredField("peer").apply { isAccessible = true }
+    }
+
+    fun resolveNativeViewPointer(component: Component): Long {
+        val peer = componentPeerField.get(component)
+            ?: error("AWT component peer is not ready for native playback.")
+
+        // XCanvasPeer extends ... extends XBaseWindow which has getWindow() returning X11 Window ID
+        val pointer = invokeLongDeep(peer, "getWindow")
+        if (pointer == 0L) {
+            // Fallback: try getContentWindow() which also exists on XBaseWindow
+            val contentWindow = invokeLongDeep(peer, "getContentWindow")
+            if (contentWindow != 0L) return contentWindow
+            error("Linux X11 AWT window pointer was zero.")
+        }
+        return pointer
+    }
+
+    private fun findMethodDeep(type: Class<*>, name: String): Method {
+        var current: Class<*>? = type
+        while (current != null) {
+            for (m in current.declaredMethods) {
+                if (m.name == name && m.parameterCount == 0) {
+                    m.isAccessible = true
+                    return m
+                }
+            }
+            current = current.superclass
+        }
+        error("Method $name was not found on ${type.name}.")
+    }
+
+    private fun invokeLongDeep(target: Any, methodName: String): Long =
+        (findMethodDeep(target.javaClass, methodName).invoke(target) as Number).toLong()
 }

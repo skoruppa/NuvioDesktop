@@ -50,7 +50,7 @@ actual fun PlatformPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS) {
+    if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS || DesktopHostOs.current == DesktopHostOs.LINUX) {
         NativePlayerSurface(
             sourceUrl = sourceUrl,
             sourceHeaders = sourceHeaders,
@@ -151,7 +151,7 @@ private fun NativePlayerSurface(
     }
 
     LaunchedEffect(controller, sourceUrl, playbackHeaders, decoderPriority, nvidiaRtxSuperResolutionEnabled, hostFirstFullSizePaintComplete.value) {
-        if (!hostFirstFullSizePaintComplete.value) {
+        if (!hostFirstFullSizePaintComplete.value && DesktopHostOs.current != DesktopHostOs.LINUX) {
             return@LaunchedEffect
         }
         delay(16L)
@@ -205,7 +205,7 @@ private fun NativePlayerSurface(
             factory = {
                 host
             },
-            modifier = if (hostFirstPaintComplete.value) {
+            modifier = if (hostFirstPaintComplete.value || DesktopHostOs.current == DesktopHostOs.LINUX) {
                 Modifier.fillMaxSize()
             } else {
                 Modifier
