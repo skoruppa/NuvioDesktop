@@ -898,19 +898,6 @@ val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
     )
 }
 
-val buildLinuxWebKitOverlay = tasks.register<Exec>("buildLinuxWebKitOverlay") {
-    enabled = false /* DISABLED: replaced by JCEF off-screen rendering */
-    val sourceFile = layout.projectDirectory.file("src/desktopMain/native/linux/webkit_overlay.c").asFile
-    val outputFile = linuxPlayerBridgeOutput.get().asFile.parentFile.resolve("webkit_overlay")
-    inputs.file(sourceFile)
-    outputs.file(outputFile)
-    commandLine(
-        "/bin/sh", "-c",
-        "gcc -O2 -o ${outputFile.absolutePath} ${sourceFile.absolutePath} " +
-            "\$(pkg-config --cflags --libs gtk+-3.0 webkit2gtk-4.1) -lX11 -lXcomposite"
-    )
-}
-
 tasks.withType<Jar>().configureEach {
     if (isMacHost && name == "desktopJar") {
         dependsOn(buildMacosPlayerBridge)

@@ -8,10 +8,9 @@
  * - All system libraries loaded via dlopen (libmpv, libEGL, libX11, libgtk-3, libwebkit2gtk-4.1, libcairo)
  * - EGL context created via eglGetPlatformDisplay (X11 platform)
  * - mpv with vo=libmpv + render API rendering into EGL surface
- * - WebKitGTK in-process offscreen rendering: GtkOffscreenWindow hosts a WebKitWebView
- *   with hardware acceleration disabled. Cairo surface pixels (ARGB32/BGRA on LE) are
- *   captured periodically (~30fps), uploaded as a GL texture, and alpha-composited over
- *   the mpv frame before eglSwapBuffers.
+ * - WebKitGTK in-process offscreen rendering via webkit_web_view_get_snapshot:
+ *   snapshot pixels (ARGB32/BGRA on LE) are uploaded as a GL texture and
+ *   alpha-composited over the mpv frame before eglSwapBuffers.
  * - GTK event pump (g_main_context_iteration) runs in the render loop for WebKit processing.
  * - JNI callback for events via NativePlayerEventSink.onPlayerEvent(String, Double)
  */
@@ -28,16 +27,6 @@
 #include <unistd.h>
 #include <math.h>
 #include <locale.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <dlfcn.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <math.h>
-#include <sys/wait.h>
-#include <sys/select.h>
-#include <signal.h>
 #include <time.h>
 
 /* ============================================================================
@@ -208,10 +197,6 @@ static fn_glPixelStorei gl_PixelStorei = NULL;
 
 static int gl_funcs_loaded = 0;
 
-/* Second offscreen window/webview — unused, kept for ABI compatibility */
-static void *g_gtk_window2 = NULL;
-static void *g_web_view2 = NULL;
-static void *g_content_manager2 = NULL;
 /* Primary offscreen window/webview (black-pass) — also persists to avoid WebKit crash */
 static void *g_gtk_window_black = NULL;
 static void *g_web_view_black = NULL;
@@ -220,8 +205,6 @@ static void *g_content_manager_black = NULL;
 static void *g_current_player = NULL;
 /* Snapshot pending flag — shared between render loop and async callback */
 volatile int g_snapshot_pending = 0;
-/* Pipelined snapshot: when 1, on_snapshot_ready re-requests immediately */
-volatile int g_snapshot_pipeline_enabled = 0;
 /* Dirty flag: set by mouse/input events, cleared after snapshot request.
  * When dirty, we request snapshot even if controls haven't visually changed,
  * ensuring hover states are captured with minimal latency. */
@@ -581,32 +564,17 @@ typedef struct {
     long long initial_position_ms;
     char *controls_page_url;
     int decoder_priority;
-    /* JCEF overlay — pixel staging for GL texture upload */
-    unsigned char *overlay_staging;      /* Staging buffer (BGRA pixels from JCEF) */
+    /* Overlay — pixel staging for GL texture upload */
+    unsigned char *overlay_staging;      /* Staging buffer (BGRA pixels from snapshot/external) */
     int overlay_staging_width;
     int overlay_staging_height;
     pthread_mutex_t overlay_mutex;       /* Protects staging buffer */
     volatile int overlay_dirty;          /* 1 when new pixels copied to staging */
-    unsigned int overlay_texture;        /* GL texture ID (black pass) */
-    unsigned int overlay_texture2;       /* GL texture ID (unused, legacy) */
-    unsigned char *overlay_staging2;     /* White-pass staging buffer */
-    int overlay_staging2_width;
-    int overlay_staging2_height;
-    volatile int overlay_dirty2;         /* 1 when white-pass staging updated */
+    unsigned int overlay_texture;        /* GL texture ID */
     unsigned int overlay_shader;         /* Shader program for alpha-blended quad */
     unsigned int overlay_vao;            /* VAO for fullscreen quad */
     unsigned int overlay_vbo;            /* VBO for quad vertices */
     int overlay_initialized;             /* 1 after GL resources created */
-#if 0 /* Legacy WebKit overlay subprocess — kept for reference */
-    /* WebKit overlay subprocess */
-    pid_t overlay_pid;              /* child process PID */
-    int overlay_stdin_fd;           /* pipe to write commands to subprocess */
-    int overlay_stdout_fd;          /* pipe to read events from subprocess */
-    char *overlay_exe_path;         /* path to webkit_overlay executable */
-    /* Overlay resize tracking */
-    int last_overlay_width;         /* last known host window width */
-    int last_overlay_height;        /* last known host window height */
-#endif
     /* EGL state for libmpv render API */
     void *egl_display;
     void *egl_surface;
@@ -907,12 +875,6 @@ static void init_overlay_gl(PlayerInstance *p) {
         "    vTexCoord = aTexCoord;\n"
         "}\n";
 
-    /* Fragment shader — black-key transparency.
-     * Single-pass: WebKit renders on black background.
-     * Pixels that are near-black = transparent (background showing through).
-     * All colored/bright pixels = fully opaque (UI elements).
-     * This sacrifices semi-transparent gradients (they become transparent)
-     * but correctly shows all opaque UI and lets video show through. */
     /* Fragment shader — premultiplied alpha passthrough.
      * With RGBA visual on GtkOffscreenWindow, cairo surface has true alpha channel.
      * Cairo ARGB32 is premultiplied, so we un-premultiply and use straight alpha blending. */
@@ -921,7 +883,6 @@ static void init_overlay_gl(PlayerInstance *p) {
         "in vec2 vTexCoord;\n"
         "out vec4 FragColor;\n"
         "uniform sampler2D uTexture;\n"
-        "uniform sampler2D uTexture2;\n"
         "void main() {\n"
         "    vec4 c = texture(uTexture, vTexCoord);\n"
         "    if (c.a < 0.004) {\n"
@@ -959,7 +920,7 @@ static void init_overlay_gl(PlayerInstance *p) {
     }
 
     /* Fullscreen quad: position (x,y) + texcoord (u,v) — triangle strip
-     * Note: Y-flipped texcoords because JCEF paints top-down */
+     * Note: Y-flipped texcoords because WebKit snapshot paints top-down */
     static const float quad_vertices[] = {
         /* pos       texcoord */
         -1.0f, -1.0f,  0.0f, 1.0f,  /* bottom-left  */
@@ -998,10 +959,6 @@ static void render_overlay(PlayerInstance *p, int viewport_w, int viewport_h) {
     gl_ActiveTexture(GL_TEXTURE0);
     gl_BindTexture(GL_TEXTURE_2D, p->overlay_texture);
     gl_Uniform1i(gl_GetUniformLocation(p->overlay_shader, "uTexture"), 0);
-    /* Bind texture2 if available, otherwise bind same texture (single-pass) */
-    gl_ActiveTexture(GL_TEXTURE0 + 1);
-    gl_BindTexture(GL_TEXTURE_2D, p->overlay_texture2 ? p->overlay_texture2 : p->overlay_texture);
-    gl_Uniform1i(gl_GetUniformLocation(p->overlay_shader, "uTexture2"), 1);
     gl_BindVertexArray(p->overlay_vao);
     gl_DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     gl_BindVertexArray(0);
@@ -1015,10 +972,6 @@ static void cleanup_overlay_gl(PlayerInstance *p) {
     if (p->overlay_texture) {
         gl_DeleteTextures(1, &p->overlay_texture);
         p->overlay_texture = 0;
-    }
-    if (p->overlay_texture2) {
-        gl_DeleteTextures(1, &p->overlay_texture2);
-        p->overlay_texture2 = 0;
     }
     if (p->overlay_shader) {
         gl_DeleteProgram(p->overlay_shader);
@@ -1328,19 +1281,6 @@ static gboolean run_js_on_gtk_thread(gpointer data) {
     return 0; /* G_SOURCE_REMOVE */
 }
 
-/* Variant for the secondary (white-pass) WebView */
-static gboolean run_js_on_view2(gpointer data) {
-    RunJsData *rj = (RunJsData*)data;
-    if (rj && rj->player && g_web_view2 && rj->player->running && rj->script) {
-        g_libs.webkit_web_view_run_javascript(g_web_view2, rj->script, NULL, NULL, NULL);
-    }
-    if (rj) {
-        free(rj->script);
-        free(rj);
-    }
-    return 0;
-}
-
 static void dispatch_js(PlayerInstance *p, char *script) {
     if (!p || !script) {
         free(script);
@@ -1356,11 +1296,6 @@ static void dispatch_js(PlayerInstance *p, char *script) {
     g_libs.g_idle_add(run_js_on_gtk_thread, rj);
 }
 
-/* Forward declarations for overlay (stubs — legacy subprocess replaced by JCEF) */
-static void spawn_overlay_subprocess(PlayerInstance *p);
-static void kill_overlay_subprocess_legacy(PlayerInstance *p);
-static void send_js_to_overlay(PlayerInstance *p, const char *js);
-
 /* ============================================================================
  * Player Update Timer (500ms) - runs on GTK thread
  * ============================================================================ */
@@ -1368,7 +1303,7 @@ static void send_js_to_overlay(PlayerInstance *p, const char *js);
 static gboolean player_update_timer(gpointer data) {
     PlayerInstance *p = (PlayerInstance*)data;
     if (!p || !p->running || !p->mpv) return 0;
-    if (!p->web_view) return 0; /* JCEF handles updates from Kotlin side */
+    if (!p->web_view) return 0; /* No WebView — playerUpdate handled from Kotlin side */
 
     /* Query mpv state */
     double duration = 0.0;
@@ -1429,199 +1364,6 @@ static void on_mpv_render_update(void *ctx) {
     pthread_cond_signal(&p->render_cond);
     pthread_mutex_unlock(&p->render_mutex);
 }
-
-/* ============================================================================
- * WebKit Overlay Subprocess Management (LEGACY — disabled, replaced by JCEF)
- * ============================================================================ */
-
-#if 0  /* Legacy WebKit overlay subprocess — replaced by JCEF off-screen rendering */
-
-static char* find_overlay_executable(void) {
-    /* Look for webkit_overlay next to libplayer_bridge.so */
-    /* Try several candidate paths */
-    const char *candidates[] = {
-        "/usr/lib/nuvio/webkit_overlay",
-        "/usr/local/lib/nuvio/webkit_overlay",
-        NULL
-    };
-    
-    /* First try: relative to the .so location using /proc/self/maps */
-    char maps_line[4096];
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (maps) {
-        while (fgets(maps_line, sizeof(maps_line), maps)) {
-            if (strstr(maps_line, "libplayer_bridge.so")) {
-                char *path_start = strchr(maps_line, '/');
-                if (path_start) {
-                    char *newline = strchr(path_start, '\n');
-                    if (newline) *newline = '\0';
-                    /* Get directory */
-                    char *last_slash = strrchr(path_start, '/');
-                    if (last_slash) {
-                        *last_slash = '\0';
-                        char result[4096];
-                        snprintf(result, sizeof(result), "%s/webkit_overlay", path_start);
-                        fclose(maps);
-                        if (access(result, X_OK) == 0) {
-                            return strdup(result);
-                        }
-                        /* Also try build dir variant */
-                        snprintf(result, sizeof(result), "%s/../webkit_overlay", path_start);
-                        if (access(result, X_OK) == 0) {
-                            return strdup(result);
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        fclose(maps);
-    }
-    
-    /* Try compiled build output paths */
-    const char *build_candidates[] = {
-        "composeApp/build/native/linux/webkit_overlay",
-        "build/native/linux/webkit_overlay",
-        NULL
-    };
-    for (int i = 0; build_candidates[i]; i++) {
-        if (access(build_candidates[i], X_OK) == 0) {
-            return strdup(build_candidates[i]);
-        }
-    }
-    
-    /* Try system paths */
-    for (int i = 0; candidates[i]; i++) {
-        if (access(candidates[i], X_OK) == 0) {
-            return strdup(candidates[i]);
-        }
-    }
-    
-    /* Try PATH */
-    if (access("/usr/bin/webkit_overlay", X_OK) == 0) {
-        return strdup("/usr/bin/webkit_overlay");
-    }
-    
-    return NULL;
-}
-
-static void spawn_overlay_subprocess(PlayerInstance *p) {
-    if (!p->controls_page_url || !p->host_window) return;
-    
-    char *exe = find_overlay_executable();
-    if (!exe) {
-        fprintf(stderr, "[player_bridge] webkit_overlay executable not found, controls will be unavailable\n");
-        return;
-    }
-    p->overlay_exe_path = exe;
-    
-    int stdin_pipe[2];  /* parent writes, child reads */
-    int stdout_pipe[2]; /* child writes, parent reads */
-    
-    if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0) {
-        fprintf(stderr, "[player_bridge] Failed to create pipes for overlay subprocess\n");
-        return;
-    }
-    
-    char xid_arg[64], width_arg[32], height_arg[32], url_arg[4096];
-    /* Use 32-bit render_window as parent for overlay (same depth = no BadMatch) */
-    unsigned long overlay_parent = p->render_window ? p->render_window : p->host_window;
-    snprintf(xid_arg, sizeof(xid_arg), "--xid=%lu", overlay_parent);
-    snprintf(width_arg, sizeof(width_arg), "--width=1280");
-    snprintf(height_arg, sizeof(height_arg), "--height=720");
-    snprintf(url_arg, sizeof(url_arg), "--url=%s", p->controls_page_url);
-    
-    pid_t pid = fork();
-    if (pid == 0) {
-        /* Child process */
-        close(stdin_pipe[1]);  /* close write end of stdin pipe */
-        close(stdout_pipe[0]); /* close read end of stdout pipe */
-        dup2(stdin_pipe[0], STDIN_FILENO);
-        dup2(stdout_pipe[1], STDOUT_FILENO);
-        close(stdin_pipe[0]);
-        close(stdout_pipe[1]);
-        
-        /* Force X11 backend for GTK in subprocess — required for RGBA compositing */
-        setenv("GDK_BACKEND", "x11", 1);
-        
-        execl(exe, "webkit_overlay", xid_arg, url_arg, width_arg, height_arg, NULL);
-        /* If exec fails */
-        fprintf(stderr, "[player_bridge] execl webkit_overlay failed\n");
-        _exit(1);
-    } else if (pid > 0) {
-        /* Parent process */
-        close(stdin_pipe[0]);  /* close read end */
-        close(stdout_pipe[1]); /* close write end */
-        p->overlay_pid = pid;
-        p->overlay_stdin_fd = stdin_pipe[1];
-        p->overlay_stdout_fd = stdout_pipe[0];
-        fprintf(stderr, "[player_bridge] Spawned webkit_overlay pid=%d\n", pid);
-    } else {
-        fprintf(stderr, "[player_bridge] fork() failed for overlay subprocess\n");
-        close(stdin_pipe[0]);
-        close(stdin_pipe[1]);
-        close(stdout_pipe[0]);
-        close(stdout_pipe[1]);
-    }
-}
-
-static void send_overlay_command(PlayerInstance *p, const char *json_line) {
-    if (!p || p->overlay_stdin_fd <= 0) return;
-    size_t len = strlen(json_line);
-    write(p->overlay_stdin_fd, json_line, len);
-    write(p->overlay_stdin_fd, "\n", 1);
-}
-
-/**
- * Send a JavaScript snippet to the overlay subprocess for evaluation.
- * Uses simple line protocol: "EVAL:<raw js>\n"
- * The JS can contain any characters except literal newlines (which JSON from Kotlin won't have).
- */
-static void send_js_to_overlay(PlayerInstance *p, const char *js) {
-    if (!p || p->overlay_stdin_fd <= 0 || !js) return;
-    /* Protocol: "EVAL:<js>\n" — no JSON wrapping, no escaping needed */
-    size_t js_len = strlen(js);
-    size_t line_len = 5 + js_len + 1; /* "EVAL:" + js + "\n" */
-    char *line = (char*)malloc(line_len + 1);
-    if (!line) return;
-    memcpy(line, "EVAL:", 5);
-    memcpy(line + 5, js, js_len);
-    line[5 + js_len] = '\n';
-    line[5 + js_len + 1] = '\0';
-    write(p->overlay_stdin_fd, line, 5 + js_len + 1);
-    free(line);
-}
-
-static void kill_overlay_subprocess(PlayerInstance *p) {
-    if (p->overlay_pid > 0) {
-        /* Send QUIT command */
-        if (p->overlay_stdin_fd > 0) {
-            write(p->overlay_stdin_fd, "QUIT\n", 5);
-        }
-        usleep(100000); /* 100ms grace */
-        kill(p->overlay_pid, SIGTERM);
-        int status;
-        waitpid(p->overlay_pid, &status, WNOHANG);
-        p->overlay_pid = 0;
-    }
-    if (p->overlay_stdin_fd > 0) {
-        close(p->overlay_stdin_fd);
-        p->overlay_stdin_fd = 0;
-    }
-    if (p->overlay_stdout_fd > 0) {
-        close(p->overlay_stdout_fd);
-        p->overlay_stdout_fd = 0;
-    }
-    free(p->overlay_exe_path);
-    p->overlay_exe_path = NULL;
-}
-
-#endif /* Legacy WebKit overlay subprocess */
-
-/* Stubs for legacy code paths that still reference overlay subprocess functions */
-static void spawn_overlay_subprocess(PlayerInstance *p) { (void)p; }
-static void kill_overlay_subprocess_legacy(PlayerInstance *p) { (void)p; }
-static void send_js_to_overlay(PlayerInstance *p, const char *js) { (void)p; (void)js; }
 
 /* ============================================================================
  * WebKit Overlay Creation (RGBA offscreen + webkit_web_view_get_snapshot)
@@ -1862,7 +1604,6 @@ static void create_webkit_overlay_on_gtk_thread(PlayerInstance *p) {
      * GL resources (shader, VAO, texture) must be recreated. */
     p->overlay_initialized = 0;
     p->overlay_texture = 0;
-    p->overlay_texture2 = 0;
     p->overlay_shader = 0;
     p->overlay_vao = 0;
     p->overlay_vbo = 0;
@@ -2088,7 +1829,7 @@ static void* gtk_thread_func(void *arg) {
     fprintf(stderr, "[player_bridge] EGL config chosen (%d configs available)\n", num_configs);
 
     /* Create EGL window surface directly on Canvas host window (24-bit).
-     * JCEF overlay compositing happens in GL (alpha blend in shader), not X11 —
+     * Overlay compositing happens in GL (alpha blend in shader), not X11 —
      * so we don't need a 32-bit window. */
     p->egl_surface = egl_createWindowSurface(p->egl_display, egl_config,
                                               (EGLNativeWindowType)p->host_window, NULL);
@@ -2306,7 +2047,7 @@ static void* gtk_thread_func(void *arg) {
                 }
                 if (p->overlay_initialized) {
                     pthread_mutex_lock(&p->overlay_mutex);
-                    /* Upload black-pass texture */
+                    /* Upload overlay texture */
                     if (p->overlay_staging && p->overlay_staging_width > 0 && p->overlay_staging_height > 0) {
                         if (!p->overlay_texture) gl_GenTextures(1, &p->overlay_texture);
                         gl_BindTexture(GL_TEXTURE_2D, p->overlay_texture);
@@ -2317,19 +2058,7 @@ static void* gtk_thread_func(void *arg) {
                         gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                         gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                     }
-                    /* Upload white-pass texture if available */
-                    if (p->overlay_staging2 && p->overlay_staging2_width > 0 && p->overlay_staging2_height > 0) {
-                        if (!p->overlay_texture2) gl_GenTextures(1, &p->overlay_texture2);
-                        gl_BindTexture(GL_TEXTURE_2D, p->overlay_texture2);
-                        gl_PixelStorei(0x0CF5, 1);
-                        gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
-                                      p->overlay_staging2_width, p->overlay_staging2_height,
-                                      0, GL_BGRA, GL_UNSIGNED_BYTE, p->overlay_staging2);
-                        gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                        gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                    }
                     p->overlay_dirty = 0;
-                    p->overlay_dirty2 = 0;
                     pthread_mutex_unlock(&p->overlay_mutex);
                     render_overlay(p, w, h);
                 }
@@ -2587,52 +2316,6 @@ static void* gtk_thread_func(void *arg) {
                 wk_snap(p->web_view, 1, 0, NULL, (void*)on_snapshot_ready, p);
             }
         }
-
-        /* Poll overlay subprocess — DISABLED (JCEF events come via JNI) */
-#if 0
-        if (p->overlay_stdout_fd > 0) {
-            fd_set rfds; struct timeval tv = {0, 0};
-            FD_ZERO(&rfds); FD_SET(p->overlay_stdout_fd, &rfds);
-            while (select(p->overlay_stdout_fd + 1, &rfds, NULL, NULL, &tv) > 0) {
-                char lb[4096]; ssize_t n = read(p->overlay_stdout_fd, lb, sizeof(lb)-1);
-                if (n <= 0) { close(p->overlay_stdout_fd); p->overlay_stdout_fd = 0; break; }
-                lb[n] = '\0'; char *ls = lb; char *nl;
-                while ((nl = strchr(ls, '\n')) != NULL) {
-                    *nl = '\0';
-                    if (ls[0]) { char t[128]; double v=0; if(parse_message_json(ls,t,sizeof(t),&v)) send_player_event(p,t,v); }
-                    ls = nl + 1;
-                }
-                FD_ZERO(&rfds); FD_SET(p->overlay_stdout_fd, &rfds); tv.tv_sec=0; tv.tv_usec=0;
-            }
-        }
-#endif
-        
-        /* Player update every ~500ms — DISABLED (JCEF handles playerUpdate from Kotlin side) */
-#if 0
-        static int uc = 0; uc++;
-        if (uc >= 30 && p->mpv && p->overlay_stdin_fd > 0) {
-            uc = 0;
-            double dur=0, pos=0; int pau=0, see=0, pfc=0, eof=0;
-            g_libs.mpv_get_property(p->mpv, "duration", MPV_FORMAT_DOUBLE, &dur);
-            g_libs.mpv_get_property(p->mpv, "time-pos", MPV_FORMAT_DOUBLE, &pos);
-            g_libs.mpv_get_property(p->mpv, "pause", MPV_FORMAT_FLAG, &pau);
-            g_libs.mpv_get_property(p->mpv, "seeking", MPV_FORMAT_FLAG, &see);
-            g_libs.mpv_get_property(p->mpv, "paused-for-cache", MPV_FORMAT_FLAG, &pfc);
-            g_libs.mpv_get_property(p->mpv, "eof-reached", MPV_FORMAT_FLAG, &eof);
-            int ld = see||pfc; p->is_loading=ld; p->is_ended=eof;
-            if(dur<0)dur=0; if(pos<0)pos=0;
-            char at[8192], st_buf[8192];
-            build_tracks_json(p, "audio", 0, at, sizeof(at));
-            build_tracks_json(p, "sub", 1, st_buf, sizeof(st_buf));
-            int ss = strlen(at)+strlen(st_buf)+512;
-            char *scr = (char*)malloc(ss);
-            if(scr){
-                snprintf(scr,ss,"window.playerUpdate&&window.playerUpdate({duration:%.3f,position:%.3f,paused:%s,loading:%s,audioTracks:%s,subtitleTracks:%s})",
-                    dur,pos,pau?"true":"false",ld?"true":"false",at,st_buf);
-                send_js_to_overlay(p, scr); free(scr);
-            }
-        }
-#endif
     }
     
     /* Cleanup */
@@ -2646,17 +2329,13 @@ static void* gtk_thread_func(void *arg) {
     if (p->web_view) {
         g_libs.webkit_web_view_load_uri(p->web_view, "about:blank");
     }
-    if (g_web_view2) {
-        g_libs.webkit_web_view_load_uri(g_web_view2, "about:blank");
-    }
     p->web_view = NULL;
     p->gtk_window = NULL;
     p->content_manager = NULL;
     /* Persistent WebKit views handled above — not destroyed */
-    /* Overlay GL resources (legacy — kept for JCEF updateOverlayPixels path) */
+    /* Overlay GL resources */
     cleanup_overlay_gl(p);
     if (p->overlay_staging) { free(p->overlay_staging); p->overlay_staging = NULL; }
-    if (p->overlay_staging2) { free(p->overlay_staging2); p->overlay_staging2 = NULL; }
     pthread_mutex_destroy(&p->overlay_mutex);
     if (p->render_ctx) { g_libs.mpv_render_context_free(p->render_ctx); p->render_ctx = NULL; }
     if (p->mpv) { g_libs.mpv_destroy(p->mpv); p->mpv = NULL; }
@@ -2945,7 +2624,7 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_updateControls(
             /* dispatch_js takes ownership of script */
         }
     } else {
-        /* Store for later flush (JCEF gets controls via Kotlin-side executeJavaScript) */
+        /* Store for later flush (controls dispatched when WebView is ready) */
         free(p->pending_controls_json);
         p->pending_controls_json = strdup(json);
     }
@@ -2953,7 +2632,7 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_updateControls(
     (*env)->ReleaseStringUTFChars(env, controlsJson, json);
 }
 
-/* ---------- updateOverlayPixels (JCEF off-screen rendering) ---------- */
+/* ---------- updateOverlayPixels (external pixel upload for GL overlay) ---------- */
 JNIEXPORT void JNICALL
 Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_updateOverlayPixels(
     JNIEnv *env, jobject bridge, jlong handle, jobject pixelBuffer, jint width, jint height)
@@ -3656,7 +3335,7 @@ Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_setWindowBorderles
 
 /* ---------- loadLibraryGlobal ---------- */
 /* Loads a shared library with RTLD_GLOBAL so its symbols override existing ones
- * for subsequent dlopen calls. Used to load gtk_override.so before JCEF/CEF init. */
+ * for subsequent dlopen calls. */
 JNIEXPORT void JNICALL
 Java_com_nuvio_app_features_player_desktop_NativePlayerBridge_loadLibraryGlobal(
     JNIEnv *env,
